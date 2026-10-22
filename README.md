@@ -187,7 +187,7 @@ uv run python3 main.py server --port 8080
 docker run -d \
   --name aistudio-api \
   --restart unless-stopped \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
   -v aistudio-api-data:/app/data \
   ghcr.io/deconstructedcube/aistudio-api:latest
 ```
@@ -195,10 +195,18 @@ docker run -d \
 使用 Docker Compose 启动：
 
 ```bash
+cp .env.example .env
+# 按需编辑 .env 后启动（默认从本地源码构建）
 docker compose up -d
+# 使用预构建镜像时改为：
+# docker compose -f docker-compose.deploy.yml up -d
 ```
 
-启动后访问 **`http://localhost:8080`**（或服务器 IP 端口）进入管理控制台。
+两个 Compose 文件均通过 `env_file` 加载 `.env`，修改后执行对应的 `docker compose up -d` 使配置生效。默认仅发布到宿主机 `127.0.0.1:8080`；在 `.env` 中修改 `AISTUDIO_PORT` 可同步调整服务、端口映射和健康检查，修改 `AISTUDIO_BIND_ADDRESS` 可指定宿主机绑定地址（如 `0.0.0.0` 允许远程访问）。浏览器调试端口默认不发布。
+
+可选路径变量保持注释即可使用镜像默认值；Docker 中自定义路径应填写容器内路径。源码构建使用宿主机 `config.yaml`，预构建镜像将配置保存在数据卷的 `/app/data/config.yaml`。
+
+启动后访问 **`http://localhost:8080`** 进入管理控制台（自定义端口时使用对应端口）。
 
 ---
 

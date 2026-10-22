@@ -17,7 +17,7 @@ dist
 build
 .pytest_cache
 
-# Environment (use .env.example as reference, mount .env at runtime)
+# Environment (use .env.example as reference, load .env via env_file at runtime)
 .env
 .env.local
 

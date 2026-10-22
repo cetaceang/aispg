@@ -187,7 +187,7 @@ CloakBrowser is bundled in the container image for immediate use:
 docker run -d \
   --name aistudio-api \
   --restart unless-stopped \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
   -v aistudio-api-data:/app/data \
   ghcr.io/deconstructedcube/aistudio-api:latest
 ```
@@ -195,10 +195,18 @@ docker run -d \
 Or run with Docker Compose:
 
 ```bash
+cp .env.example .env
+# Edit .env as needed, then start (builds from local source by default)
 docker compose up -d
+# To use the prebuilt image instead:
+# docker compose -f docker-compose.deploy.yml up -d
 ```
 
-Open **`http://localhost:8080`** in your browser to access the Web Console.
+Both Compose files load `.env` through `env_file`; rerun the corresponding `docker compose up -d` after changing it. Ports are published on the host's `127.0.0.1:8080` by default. Change `AISTUDIO_PORT` in `.env` to update the service port, port mapping, and health check together. Set `AISTUDIO_BIND_ADDRESS` to choose the host binding address (e.g. `0.0.0.0` for remote access). The browser debugging port is not published by default.
+
+Leave optional path variables commented out to use image defaults; custom Docker paths must refer to paths inside the container. Source builds use the host's `config.yaml`; the prebuilt image stores configuration at `/app/data/config.yaml` in the data volume.
+
+Open **`http://localhost:8080`** in your browser to access the Web Console (use your chosen port if customized).
 
 ---
 

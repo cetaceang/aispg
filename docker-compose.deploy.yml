@@ -3,17 +3,19 @@ services:
     image: ghcr.io/deconstructedcube/aistudio-api:latest
     container_name: aistudio-api
     restart: unless-stopped
+    env_file:
+      - .env
+    command: ["python3", "main.py", "server"]
     ports:
-      - "8080:8080"
+      - "${AISTUDIO_BIND_ADDRESS:-127.0.0.1}:${AISTUDIO_PORT:-8080}:${AISTUDIO_PORT:-8080}"
     volumes:
       - aistudio-api-data:/app/data
-    environment:
-      - AISTUDIO_DATA_DIR=/app/data
-      - AISTUDIO_ACCOUNTS_DIR=/app/data/accounts
-      - AISTUDIO_STATS_FILE=/app/data/stats.json
-      - AISTUDIO_ROTATOR_STATE_FILE=/app/data/rotator_state.json
-      - AISTUDIO_CONFIG_FILE=/app/data/config.yaml
-      - AISTUDIO_BROWSER_EXECUTABLE=/opt/cloakbrowser/chrome
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:$${AISTUDIO_PORT:-8080}/v1beta/models || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
 
 volumes:
   aistudio-api-data:
