@@ -10,6 +10,10 @@ build/
 *.egg-info/
 
 /data/
+/waa-signer/.deps/
+/waa-signer/bin/
+wgcf-account.toml
+wgcf-profile.conf
 /tmp/
 stream_response.txt
 dumps/

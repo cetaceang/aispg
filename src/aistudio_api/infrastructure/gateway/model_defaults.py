@@ -29,6 +29,12 @@ _SAFETY_CATEGORY_ORDER = (
 
 
 @dataclass(frozen=True)
+class TierQuotaLimits:
+    daily_limit: int = 20
+    daily_token_limit: int | None = None
+
+
+@dataclass(frozen=True)
 class ModelDefaults:
     is_image_model: bool = False
     default_tools: tuple[str, ...] = ()
@@ -126,8 +132,12 @@ class ModelProfile:
         )
 
 
-def _normalize_model_name(model: str) -> str:
-    return model.removeprefix("models/").lower()
+def normalize_model_name(model: str) -> str:
+    """Normalize model string (strip, lowercase, remove 'models/' prefix)."""
+    return model.strip().removeprefix("models/").lower()
+
+
+_normalize_model_name = normalize_model_name
 
 
 def _coerce_thinking_level(value: object) -> ThinkingLevel:
@@ -172,13 +182,38 @@ def _coerce_generation_defaults(raw: dict[str, object] | None) -> dict[str, obje
     coerced: dict[str, object] = {}
     for key, value in raw.items():
         if key == "thinking_config" and isinstance(value, dict):
-            level = _coerce_thinking_level(value.get("level", ThinkingLevel.HIGH))
-            mode = int(value.get("mode", 1))
-            coerced[key] = AistudioThinkingConfig(level=level, mode=mode).to_wire()
+            raw_level = value.get(
+                "level", value.get("thinkingLevel", value.get("thinking_level"))
+            )
+            raw_budget = value.get(
+                "budget", value.get("thinkingBudget", value.get("thinking_budget"))
+            )
+            raw_mode = value.get("mode")
+            level = _coerce_thinking_level(raw_level) if raw_level is not None else None
+            budget = (
+                int(str(raw_budget))
+                if raw_budget is not None and not isinstance(raw_budget, bool)
+                else None
+            )
+            if level is not None or budget is not None or raw_mode is not None:
+                mode = (
+                    int(str(raw_mode))
+                    if raw_mode is not None and not isinstance(raw_mode, bool)
+                    else 1
+                )
+                coerced[key] = AistudioThinkingConfig(
+                    level=level, mode=mode, budget=budget
+                ).to_wire()
+            else:
+                coerced[key] = None
         elif key == "image_output_mode":
-            coerced[key] = _coerce_image_output_mode(value)
+            coerced[key] = (
+                _coerce_image_output_mode(value) if value is not None else None
+            )
         elif key == "media_resolution":
-            coerced[key] = _coerce_media_resolution(value)
+            coerced[key] = (
+                _coerce_media_resolution(value) if value is not None else None
+            )
         else:
             coerced[key] = value
     return coerced
@@ -270,6 +305,31 @@ def _profile_from_mapping(raw: dict[str, object]) -> ModelProfile:
 
 def _default_config() -> dict[str, object]:
     return {
+        "waa": {
+            "active_server": "local_spidermonkey",
+            "servers": [
+                {
+                    "id": "local_spidermonkey",
+                    "name": "本地原生引擎 (SpiderMonkey 152)",
+                    "description": "本地独立纯静态 Go 服务，毫秒级快速生成官方原生高精度快照 Proof",
+                    "url": "http://127.0.0.1:8081",
+                    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0",
+                    "headers": {
+                        "X-User-Agent": "grpc-web-javascript/0.1",
+                    },
+                },
+                {
+                    "id": "remote_spinsnow",
+                    "name": "远程公共服务 (spinsnow / NodeVM)",
+                    "description": "远程 Node.js VM 沙箱证明签名服务，绑定 Chromium 模拟特征环境",
+                    "url": "https://waa.spinsnow.fun",
+                    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+                    "headers": {
+                        "X-User-Agent": "grpc-web-javascript/0.1",
+                    },
+                },
+            ],
+        },
         "logging": {
             "level": "INFO",
             "dump_requests": False,
@@ -279,20 +339,21 @@ def _default_config() -> dict[str, object]:
             "profiles": [
                 {
                     "name": "image_models",
-                    "match": {"contains": ["image"]},
+                    "match": {"contains": ["image", "imagen"]},
                     "is_image_model": True,
-                    "generation_config_defaults": {
-                        "response_mime_type": None,
-                        "image_output_mode": "image_only",
-                        "thinking_config": {"level": "MINIMAL", "mode": 1},
+                    "disable_safety_settings": True,
+                },
+                {
+                    "name": "video_models",
+                    "match": {
+                        "prefixes": ["veo-"],
+                        "contains": ["veo", "omni", "video"],
                     },
-                    "clear_generation_config_indexes": [7, 13, 17],
                     "disable_safety_settings": True,
                 },
                 {
                     "name": "gemma_models",
                     "match": {"prefixes": ["gemma-"]},
-                    "default_tools": ["google_search"],
                     "safety_settings": {
                         "Harassment": 5,
                         "Hate": 5,
@@ -309,10 +370,183 @@ def _default_config() -> dict[str, object]:
                         "Sexually Explicit": 5,
                         "Dangerous Content": 5,
                     },
+                    "drop_unsupported_params": True,
                 },
             ],
             "models": {},
         },
+        "rotator": {
+            "max_retries": 5,
+            "strategy": "sticky",
+            "stickiness_bonus": 400.0,
+            "stickiness_threshold": 0.8,
+            "drip_penalty": 500.0,
+            "tier_weights": {
+                "Free": 0.0,
+                "Plus": 0.5,
+                "Pro": 1.0,
+                "Ultra": 2.0,
+                "Ultra_20X": 3.0,
+            },
+            "cooldowns": {
+                "rate_limited_short": 60,
+                "rate_limited_drip": 300,
+                "rate_limited_drip_extended": 600,
+            },
+        },
+        "paid_model_rules": {
+            "ultra_required": {
+                "contains": ["veo", "ultra", "omni", "carbon"],
+                "required_tiers": ["Ultra", "Ultra_20X"],
+            },
+            "pro_required": {
+                "contains": ["argon", "image", "imagen", "gemini-3.1-pro"],
+                "required_tiers": ["Pro", "Ultra", "Ultra_20X"],
+            },
+        },
+        "tier_quotas": {
+            "Free": {
+                "hydrogen_models": {
+                    "match": {"contains": ["hydrogen"]},
+                    "daily_limit": 50,
+                    "daily_token_limit": 10_000_000,
+                },
+                "flash_models": {
+                    "match": {"contains": ["flash"]},
+                    "daily_limit": 50,
+                    "daily_token_limit": 5_000_000,
+                },
+                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 10},
+                "default_limit": 20,
+            },
+            "Plus": {
+                "hydrogen_models": {
+                    "match": {"contains": ["hydrogen"]},
+                    "daily_limit": 50,
+                    "daily_token_limit": 10_000_000,
+                },
+                "flash_models": {
+                    "match": {"contains": ["flash"]},
+                    "daily_limit": 100,
+                    "daily_token_limit": 10_000_000,
+                },
+                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 30},
+                "default_limit": 50,
+            },
+            "Pro": {
+                "hydrogen_models": {
+                    "match": {"contains": ["hydrogen"]},
+                    "daily_limit": 100,
+                    "daily_token_limit": 25_000_000,
+                },
+                "argon_models": {
+                    "match": {"contains": ["argon"]},
+                    "daily_limit": 50,
+                    "daily_token_limit": 15_000_000,
+                },
+                "image_models": {
+                    "match": {"contains": ["image", "imagen"]},
+                    "daily_limit": 50,
+                },
+                "flash_models": {
+                    "match": {"contains": ["flash"]},
+                    "daily_limit": 150,
+                    "daily_token_limit": 25_000_000,
+                },
+                "pro_models": {
+                    "match": {"contains": ["pro"]},
+                    "daily_limit": 50,
+                    "daily_token_limit": 13_000_000,
+                },
+                "default_limit": 50,
+            },
+            "Ultra": {
+                "hydrogen_models": {
+                    "match": {"contains": ["hydrogen"]},
+                    "daily_limit": 200,
+                },
+                "argon_models": {
+                    "match": {"contains": ["argon"]},
+                    "daily_limit": 200,
+                },
+                "carbon_models": {
+                    "match": {"contains": ["carbon"]},
+                    "daily_limit": 200,
+                },
+                "image_models": {
+                    "match": {"contains": ["image", "imagen"]},
+                    "daily_limit": 200,
+                },
+                "video_models": {"match": {"contains": ["veo"]}, "daily_limit": 50},
+                "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 200},
+                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 100},
+                "default_limit": 200,
+            },
+            "Ultra_20X": {
+                "hydrogen_models": {
+                    "match": {"contains": ["hydrogen"]},
+                    "daily_limit": 200,
+                },
+                "argon_models": {
+                    "match": {"contains": ["argon"]},
+                    "daily_limit": 200,
+                },
+                "carbon_models": {
+                    "match": {"contains": ["carbon"]},
+                    "daily_limit": 200,
+                },
+                "image_models": {
+                    "match": {"contains": ["image", "imagen"]},
+                    "daily_limit": 200,
+                },
+                "video_models": {"match": {"contains": ["veo"]}, "daily_limit": 50},
+                "flash_models": {"match": {"contains": ["flash"]}, "daily_limit": 200},
+                "pro_models": {"match": {"contains": ["pro"]}, "daily_limit": 100},
+                "default_limit": 200,
+            },
+            "overrides": {},
+        },
+        "account_presets": [
+            {
+                "id": "preset_all",
+                "name": "全部启用 (最大并发)",
+                "description": "激活所有可用账号，提供最充沛的并发与负载池",
+                "action": "enable_all",
+                "is_system": True,
+            },
+            {
+                "id": "preset_paid_only",
+                "name": "纯高阶付费池 (Plus/Pro/Ultra)",
+                "description": "仅激活具有付费权益的账号，全力保障高阶模型调用",
+                "action": "filter_tier",
+                "target_tiers": ["Plus", "Pro", "Ultra", "Ultra_20X"],
+                "is_system": True,
+            },
+            {
+                "id": "preset_ultra_only",
+                "name": "旗舰专属池 (Ultra 独占)",
+                "description": "仅激活 Ultra 顶级算力账号，保障最顶尖模型调用",
+                "action": "filter_tier",
+                "target_tiers": ["Ultra", "Ultra_20X"],
+                "is_system": True,
+            },
+            {
+                "id": "preset_free_only",
+                "name": "纯免费节能池 (Free)",
+                "description": "仅激活 Free 等级账号，用于日常普通模型测试",
+                "action": "filter_tier",
+                "target_tiers": ["Free"],
+                "is_system": True,
+            },
+            {
+                "id": "preset_production",
+                "name": "生产专属集群 (Production)",
+                "description": "仅激活 group 标记为 production 的核心业务账号",
+                "action": "filter_group",
+                "target_groups": ["production"],
+                "is_system": True,
+            },
+        ],
     }
 
 
@@ -492,12 +726,14 @@ def get_configured_logging_settings(
             "level": str(raw_logging.get("level") or "INFO").strip().upper(),
             "dump_requests": bool(raw_logging.get("dump_requests", False)),
             "dump_to_file": bool(raw_logging.get("dump_to_file", False)),
+            "dump_to_file_configured": "dump_to_file" in raw_logging,
             "dump_dir": str(raw_logging.get("dump_dir") or "").strip(),
         }
     return {
         "level": "INFO",
         "dump_requests": False,
         "dump_to_file": False,
+        "dump_to_file_configured": False,
         "dump_dir": "",
     }
 
@@ -536,3 +772,501 @@ def update_configured_logging_settings(
     )
     invalidate_config_cache()
     return logging_dict
+
+
+# ─── 订阅层级每日软额度 (Tier Quotas) 与预设方案 (Presets) ───
+def get_configured_tier_quotas(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """获取 config.yaml 中配置的订阅层级软额度规则，若缺失则安全回退至系统默认配置。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_quotas = config.get("tier_quotas")
+    if isinstance(raw_quotas, dict):
+        return raw_quotas
+    def_quotas = _default_config().get("tier_quotas")
+    if isinstance(def_quotas, dict):
+        return def_quotas
+    return {}
+
+
+def _parse_positive_int(raw: object, fallback: int) -> int:
+    if isinstance(raw, bool):
+        return fallback
+    try:
+        val = int(str(raw))
+        return val if val > 0 else fallback
+    except (ValueError, TypeError):
+        return fallback
+
+
+def _parse_optional_positive_int(
+    raw: object, fallback: int | None = None
+) -> int | None:
+    if raw is None or isinstance(raw, bool):
+        return fallback
+    try:
+        val = int(str(raw))
+        return val if val > 0 else fallback
+    except (ValueError, TypeError):
+        return fallback
+
+
+def resolve_tier_quota_limits(
+    tier: str | None,
+    model: str | None,
+    config_path: str | os.PathLike[str] | None = None,
+) -> TierQuotaLimits:
+    """计算指定账号层级在目标模型上的每日请求次数与 Token 软额度限制。"""
+    normalized_model = _normalize_model_name(model) if model else ""
+    quotas = get_configured_tier_quotas(config_path)
+
+    # 1. 解析层级基础规则
+    clean_tier = (tier or "Free").strip()
+    if clean_tier not in quotas or clean_tier == "overrides":
+        matched_key = None
+        for k in quotas:
+            if k != "overrides" and k.lower() == clean_tier.lower():
+                matched_key = k
+                break
+        if matched_key:
+            clean_tier = matched_key
+        elif "Free" in quotas:
+            clean_tier = "Free"
+        else:
+            clean_tier = next((k for k in quotas if k != "overrides"), "Free")
+
+    tier_rules = quotas.get(clean_tier)
+    base_limits = TierQuotaLimits(daily_limit=20, daily_token_limit=None)
+    if isinstance(tier_rules, dict):
+        default_limit = _parse_positive_int(tier_rules.get("default_limit"), 20)
+        default_token_limit = _parse_optional_positive_int(
+            tier_rules.get("default_token_limit")
+        )
+        base_limits = TierQuotaLimits(
+            daily_limit=default_limit,
+            daily_token_limit=default_token_limit,
+        )
+        if normalized_model:
+            for rule_key, rule_data in tier_rules.items():
+                if rule_key in (
+                    "default_limit",
+                    "default_token_limit",
+                ) or not isinstance(rule_data, dict):
+                    continue
+                raw_match = rule_data.get("match")
+                if isinstance(raw_match, dict):
+                    contains = [
+                        str(c).lower()
+                        for c in (raw_match.get("contains") or [])
+                        if isinstance(c, str)
+                    ]
+                    prefixes = [
+                        str(p).lower()
+                        for p in (raw_match.get("prefixes") or [])
+                        if isinstance(p, str)
+                    ]
+                    exact = [
+                        _normalize_model_name(str(e))
+                        for e in (raw_match.get("exact") or [])
+                        if isinstance(e, str)
+                    ]
+                    if (
+                        (exact and normalized_model in exact)
+                        or any(normalized_model.startswith(p) for p in prefixes)
+                        or any(c in normalized_model for c in contains)
+                    ):
+                        rule_daily = _parse_positive_int(
+                            rule_data.get("daily_limit"), default_limit
+                        )
+                        rule_token = (
+                            _parse_optional_positive_int(
+                                rule_data.get("daily_token_limit")
+                            )
+                            if "daily_token_limit" in rule_data
+                            else default_token_limit
+                        )
+                        base_limits = TierQuotaLimits(
+                            daily_limit=rule_daily,
+                            daily_token_limit=rule_token,
+                        )
+                        break
+
+    # 2. 精确模型覆盖 overrides (优先级最高，支持单数字或 {daily_limit, daily_token_limit})
+    raw_overrides = quotas.get("overrides")
+    if normalized_model and isinstance(raw_overrides, dict):
+        for m_key, val in raw_overrides.items():
+            if _normalize_model_name(str(m_key)) == normalized_model:
+                if isinstance(val, dict):
+                    ov_daily = (
+                        _parse_positive_int(
+                            val.get("daily_limit"), base_limits.daily_limit
+                        )
+                        if "daily_limit" in val
+                        else base_limits.daily_limit
+                    )
+                    ov_token = (
+                        _parse_optional_positive_int(val.get("daily_token_limit"))
+                        if "daily_token_limit" in val
+                        else base_limits.daily_token_limit
+                    )
+                    return TierQuotaLimits(
+                        daily_limit=ov_daily,
+                        daily_token_limit=ov_token,
+                    )
+                ov_scalar = _parse_optional_positive_int(val)
+                if ov_scalar is not None:
+                    return TierQuotaLimits(
+                        daily_limit=ov_scalar,
+                        daily_token_limit=base_limits.daily_token_limit,
+                    )
+
+    return base_limits
+
+
+def resolve_tier_quota(
+    tier: str | None,
+    model: str | None,
+    config_path: str | os.PathLike[str] | None = None,
+) -> int:
+    """计算指定账号层级在目标模型上的每日软额度限制（仅用于轮询打分权重，超额绝不禁用账号）。"""
+    return resolve_tier_quota_limits(tier, model, config_path=config_path).daily_limit
+
+
+def get_default_config_sections() -> dict[str, object]:
+    """返回内置默认配置的核心可配置区块，供前端重置与表单初始化使用。"""
+    defaults = _default_config()
+    return {
+        "model_defaults": defaults.get("model_defaults", {}),
+        "tier_quotas": defaults.get("tier_quotas", {}),
+        "paid_model_rules": defaults.get("paid_model_rules", {}),
+        "rotator": defaults.get("rotator", {}),
+    }
+
+
+def validate_config_sections(parsed: dict[str, object]) -> None:
+    """校验关键配置段结构合法性，防止非法数值或类型写入 config.yaml。"""
+
+    def _is_pos_int(v: object) -> bool:
+        return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+    def _is_nonneg_num(v: object) -> bool:
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0
+
+    if "tier_quotas" in parsed and parsed["tier_quotas"] is not None:
+        tq = parsed["tier_quotas"]
+        if not isinstance(tq, dict):
+            raise ValueError("tier_quotas 必须是字典结构")
+        for tier_key, tier_val in tq.items():
+            if tier_key == "overrides":
+                if tier_val is None:
+                    continue
+                if not isinstance(tier_val, dict):
+                    raise ValueError("tier_quotas.overrides 必须是字典结构")
+                for ov_k, ov_v in tier_val.items():
+                    if isinstance(ov_v, dict):
+                        if (
+                            "daily_limit" in ov_v
+                            and ov_v["daily_limit"] is not None
+                            and not _is_pos_int(ov_v["daily_limit"])
+                        ):
+                            raise ValueError(
+                                f"tier_quotas.overrides.{ov_k}.daily_limit 必须是正整数"
+                            )
+                        if (
+                            "daily_token_limit" in ov_v
+                            and ov_v["daily_token_limit"] is not None
+                            and not _is_pos_int(ov_v["daily_token_limit"])
+                        ):
+                            raise ValueError(
+                                f"tier_quotas.overrides.{ov_k}.daily_token_limit 必须是正整数或 null"
+                            )
+                    elif not _is_pos_int(ov_v):
+                        raise ValueError(
+                            f"tier_quotas.overrides.{ov_k} 必须是正整数或包含 daily_limit 的对象"
+                        )
+                continue
+            if not isinstance(tier_val, dict):
+                raise ValueError(f"tier_quotas.{tier_key} 必须是字典结构")
+            if (
+                "default_limit" in tier_val
+                and tier_val["default_limit"] is not None
+                and not _is_pos_int(tier_val["default_limit"])
+            ):
+                raise ValueError(f"tier_quotas.{tier_key}.default_limit 必须是正整数")
+            if (
+                "default_token_limit" in tier_val
+                and tier_val["default_token_limit"] is not None
+                and not _is_pos_int(tier_val["default_token_limit"])
+            ):
+                raise ValueError(
+                    f"tier_quotas.{tier_key}.default_token_limit 必须是正整数或 null"
+                )
+            for rule_key, rule_val in tier_val.items():
+                if rule_key in ("default_limit", "default_token_limit"):
+                    continue
+                if not isinstance(rule_val, dict):
+                    raise ValueError(
+                        f"tier_quotas.{tier_key}.{rule_key} 必须是规则对象"
+                    )
+                if "daily_limit" in rule_val and not _is_pos_int(
+                    rule_val["daily_limit"]
+                ):
+                    raise ValueError(
+                        f"tier_quotas.{tier_key}.{rule_key}.daily_limit 必须是正整数"
+                    )
+                if (
+                    "daily_token_limit" in rule_val
+                    and rule_val["daily_token_limit"] is not None
+                    and not _is_pos_int(rule_val["daily_token_limit"])
+                ):
+                    raise ValueError(
+                        f"tier_quotas.{tier_key}.{rule_key}.daily_token_limit 必须是正整数或 null"
+                    )
+
+    if "paid_model_rules" in parsed and parsed["paid_model_rules"] is not None:
+        pmr = parsed["paid_model_rules"]
+        if not isinstance(pmr, dict):
+            raise ValueError("paid_model_rules 必须是字典结构")
+        for r_key, r_val in pmr.items():
+            if not isinstance(r_val, dict):
+                raise ValueError(f"paid_model_rules.{r_key} 必须是字典结构")
+            req_tiers = r_val.get("required_tiers")
+            if not isinstance(req_tiers, list) or not all(
+                isinstance(t, str) and t.strip() for t in req_tiers
+            ):
+                raise ValueError(
+                    f"paid_model_rules.{r_key}.required_tiers 必须是非空字符串列表"
+                )
+
+    if "rotator" in parsed and parsed["rotator"] is not None:
+        rot = parsed["rotator"]
+        if not isinstance(rot, dict):
+            raise ValueError("rotator 必须是字典结构")
+        for num_field in (
+            "max_retries",
+            "stickiness_bonus",
+            "stickiness_threshold",
+            "drip_penalty",
+        ):
+            if num_field in rot and not _is_nonneg_num(rot[num_field]):
+                raise ValueError(f"rotator.{num_field} 必须是非负数字")
+        if "stickiness_threshold" in rot:
+            thresh = float(str(rot["stickiness_threshold"]))
+            if thresh > 1.0:
+                raise ValueError("rotator.stickiness_threshold 必须在 0.0 ~ 1.0 之间")
+        if "tier_weights" in rot:
+            tw = rot["tier_weights"]
+            if not isinstance(tw, dict) or not all(
+                isinstance(v, (int, float)) and not isinstance(v, bool)
+                for v in tw.values()
+            ):
+                raise ValueError("rotator.tier_weights 必须是数字映射字典")
+        if "cooldowns" in rot:
+            cds = rot["cooldowns"]
+            if not isinstance(cds, dict) or not all(
+                _is_nonneg_num(v) for v in cds.values()
+            ):
+                raise ValueError("rotator.cooldowns 必须是非负数字映射字典")
+
+
+def get_configured_presets(
+    config_path: str | os.PathLike[str] | None = None,
+) -> list[dict[str, object]]:
+    """获取 config.yaml 中配置的预设方案列表。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_presets = config.get("account_presets")
+    if isinstance(raw_presets, list):
+        return [p for p in raw_presets if isinstance(p, dict)]
+    def_presets = _default_config().get("account_presets")
+    if isinstance(def_presets, list):
+        return [p for p in def_presets if isinstance(p, dict)]
+    return []
+
+
+def get_configured_rotator_settings(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """获取 config.yaml 中配置的 rotator 调度策略、打分权重与冷却时间，若缺失安全回退至系统默认配置。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_rotator = config.get("rotator")
+    if isinstance(raw_rotator, dict):
+        return raw_rotator
+    def_rotator = _default_config().get("rotator")
+    if isinstance(def_rotator, dict):
+        return def_rotator
+    return {}
+
+
+def get_configured_paid_model_rules(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """获取 config.yaml 中配置的 paid_model_rules 付费模型判定与准入规则，若缺失安全回退至系统默认配置。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_rules = config.get("paid_model_rules")
+    if isinstance(raw_rules, dict):
+        return raw_rules
+    def_rules = _default_config().get("paid_model_rules")
+    if isinstance(def_rules, dict):
+        return def_rules
+    return {}
+
+
+# ─── WAA 签名服务多节点管理与特征绑定 (纯手动切换，不轮询) ───
+
+
+def get_configured_waa_settings(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """获取 config.yaml 中配置的 WAA 签名服务与特征设置。"""
+    resolved_path = _resolve_config_path(config_path)
+    config = _load_yaml_config(resolved_path)
+    raw_waa = config.get("waa")
+    if isinstance(raw_waa, dict):
+        return raw_waa
+    def_waa = _default_config().get("waa")
+    if isinstance(def_waa, dict):
+        return def_waa
+    return {}
+
+
+def get_active_waa_server(
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """获取当前激活的 WAA 签名服务器配置及其绑定的特征信息。"""
+    waa = get_configured_waa_settings(config_path)
+    active_id = str(waa.get("active_server") or "local_spidermonkey").strip()
+    raw_servers = waa.get("servers")
+    servers = raw_servers if isinstance(raw_servers, list) else []
+
+    for item in servers:
+        if isinstance(item, dict) and str(item.get("id") or "").strip() == active_id:
+            return dict(item)
+
+    if servers and isinstance(servers[0], dict):
+        return dict(servers[0])
+
+    return {
+        "id": "local_spidermonkey",
+        "name": "本地原生引擎 (SpiderMonkey 152)",
+        "url": "http://127.0.0.1:8081",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0",
+        "headers": {"X-User-Agent": "grpc-web-javascript/0.1"},
+    }
+
+
+def switch_active_waa_server(
+    server_id: str,
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """纯手动切换当前激活的 WAA 签名服务器，并持久化保存到 config.yaml。"""
+    resolved_path = _resolve_config_path(config_path)
+    content = (
+        resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
+    )
+    parsed = yaml.safe_load(content) or {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    raw_waa = parsed.get("waa")
+    waa_dict = dict(raw_waa) if isinstance(raw_waa, dict) else {}
+    target_id = server_id.strip()
+    waa_dict["active_server"] = target_id
+    parsed["waa"] = waa_dict
+
+    resolved_path.write_text(
+        yaml.dump(parsed, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    invalidate_config_cache()
+    return get_active_waa_server(config_path)
+
+
+def upsert_waa_server(
+    server_data: dict[str, object],
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """新增或更新指定 WAA 签名服务器配置。"""
+    import uuid
+
+    resolved_path = _resolve_config_path(config_path)
+    content = (
+        resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
+    )
+    parsed = yaml.safe_load(content) or {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    raw_waa = parsed.get("waa")
+    waa_dict = dict(raw_waa) if isinstance(raw_waa, dict) else {}
+    raw_servers = waa_dict.get("servers")
+    servers = list(raw_servers) if isinstance(raw_servers, list) else []
+
+    target_id = str(server_data.get("id") or "").strip()
+    if not target_id:
+        target_id = f"server_{uuid.uuid4().hex[:8]}"
+        server_data["id"] = target_id
+
+    updated = False
+    for idx, s in enumerate(servers):
+        if isinstance(s, dict) and str(s.get("id") or "").strip() == target_id:
+            servers[idx] = server_data
+            updated = True
+            break
+    if not updated:
+        servers.append(server_data)
+
+    waa_dict["servers"] = servers
+    parsed["waa"] = waa_dict
+    resolved_path.write_text(
+        yaml.dump(parsed, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    invalidate_config_cache()
+    return server_data
+
+
+def delete_waa_server(
+    server_id: str,
+    config_path: str | os.PathLike[str] | None = None,
+) -> bool:
+    """删除指定 ID 的 WAA 签名服务器。"""
+    resolved_path = _resolve_config_path(config_path)
+    content = (
+        resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
+    )
+    parsed = yaml.safe_load(content) or {}
+    if not isinstance(parsed, dict):
+        return False
+
+    raw_waa = parsed.get("waa")
+    if not isinstance(raw_waa, dict):
+        return False
+
+    raw_servers = raw_waa.get("servers")
+    if not isinstance(raw_servers, list):
+        return False
+
+    target_id = server_id.strip()
+    new_servers = [
+        s
+        for s in raw_servers
+        if isinstance(s, dict) and str(s.get("id") or "").strip() != target_id
+    ]
+    if len(new_servers) == len(raw_servers):
+        return False
+
+    raw_waa["servers"] = new_servers
+    if str(raw_waa.get("active_server") or "").strip() == target_id and new_servers:
+        raw_waa["active_server"] = str(new_servers[0].get("id") or "")
+
+    parsed["waa"] = raw_waa
+    resolved_path.write_text(
+        yaml.dump(parsed, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    invalidate_config_cache()
+    return True

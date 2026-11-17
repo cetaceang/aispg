@@ -70,16 +70,16 @@ def test_account_rotator_state_persistence(tmp_path, monkeypatch):
     rotator1.record_rate_limited(
         "acc_test1", "gemini-3.7-flash"
     )  # triggers 3rd 429 -> locks to midnight
-    rotator1.record_auth_error("acc_test2", "gemini-3.7-flash", cooldown_seconds=600.0)
+    rotator1.record_auth_error("acc_test2", "gemini-3.7-flash")
 
     assert rotator_file.is_file()
     saved = json.loads(rotator_file.read_text(encoding="utf-8"))
     assert "acc_test1" in saved
-    assert saved["acc_test1"]["requests"] == 4
-    assert saved["acc_test1"]["rate_limited"] == 3
-    assert "gemini-3.7-flash" in saved["acc_test1"]["model_rate_limited_dates"]
+    assert saved["acc_test1"]["total_requests"] == 4
+    assert saved["acc_test1"]["total_rate_limited"] == 3
+    assert "gemini-3.7-flash" in saved["acc_test1"]["daily_models"]
+    assert saved["acc_test1"]["daily_models"]["gemini-3.7-flash"]["requests"] == 4
     assert saved["acc_test2"]["auth_errors"] == 1
-    assert saved["acc_test2"]["auth_cooldown"] > 0
 
     # Simulate restart by creating a new AccountRotator instance
     rotator2 = AccountRotator(mock_store)
@@ -87,7 +87,7 @@ def test_account_rotator_state_persistence(tmp_path, monkeypatch):
     assert all_stats["acc_test1"]["requests"] == 4
     assert all_stats["acc_test1"]["rate_limited"] == 3
     assert not rotator2._stats["acc_test1"].is_available("gemini-3.7-flash")
-    assert not rotator2._stats["acc_test2"].is_available("gemini-3.7-flash")
+    assert rotator2._stats["acc_test2"].is_available("gemini-3.7-flash")
 
 
 def test_resolve_config_file_initializes_from_template_when_missing(
@@ -119,3 +119,26 @@ def test_resolve_config_file_never_overwrites_existing(tmp_path, monkeypatch):
 
     assert resolved == target_config
     assert target_config.read_text(encoding="utf-8") == "custom_key: preserved_value\n"
+
+
+def test_account_paths_honor_explicit_data_directory(tmp_path, monkeypatch):
+    from aistudio_api.config import discover_auth_file
+    from aistudio_api.infrastructure.account.account_store import _resolve_accounts_dir
+
+    monkeypatch.delenv("AISTUDIO_ACCOUNTS_DIR", raising=False)
+    monkeypatch.delenv("AISTUDIO_AUTH_FILE", raising=False)
+    monkeypatch.setenv("AISTUDIO_DATA_DIR", str(tmp_path / "custom-data"))
+    accounts_dir = _resolve_accounts_dir()
+    assert accounts_dir == tmp_path / "custom-data" / "accounts"
+    assert discover_auth_file() is None
+    auth = accounts_dir / "acc_test" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('{"cookies": []}', encoding="utf-8")
+    (accounts_dir / "registry.json").write_text(
+        '{"active_account_id": "acc_test"}', encoding="utf-8"
+    )
+    assert discover_auth_file() == str(auth)
+    explicit = tmp_path / "explicit-accounts"
+    monkeypatch.setenv("AISTUDIO_ACCOUNTS_DIR", str(explicit))
+    assert _resolve_accounts_dir() == explicit
+    assert discover_auth_file() is None

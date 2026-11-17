@@ -15,14 +15,17 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from aistudio_api.application.api_service_gemini import classify_gemini_error_payload
+from aistudio_api.config import settings
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.model_defaults import (
     get_configured_logging_settings,
 )
 from aistudio_api.infrastructure.utils.logger import (
     dump_request_exchange,
+    get_log_level,
     get_logger,
     is_dump_requests_enabled,
+    is_dump_to_file_enabled,
     setup_logging,
 )
 
@@ -42,19 +45,12 @@ logger = get_logger("server")
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
+async def _gateway_lifespan(_app: FastAPI):
     from aistudio_api.application.account_rotator import init_rotator
     from aistudio_api.application.account_service import AccountService
     from aistudio_api.infrastructure.account.account_store import AccountStore
-    from aistudio_api.infrastructure.browser.browser_engine import (
-        install_process_cleanup_handlers,
-    )
 
-    install_process_cleanup_handlers()
-
-    client = AIStudioClient(
-        port=runtime_state.browser_port,
-    )
+    client = AIStudioClient()
     runtime_state.client = client
 
     # 初始化账号管理服务
@@ -66,93 +62,255 @@ async def lifespan(_app: FastAPI):
     rotator = init_rotator(account_store)
     runtime_state.rotator = rotator
 
+    active_auth_path = account_store.get_active_auth_path()
+    if active_auth_path is not None:
+        await client.switch_auth(str(active_auth_path))
     logger.info(
-        "Client initialized (port=%s, accounts=%d)",
-        runtime_state.browser_port,
+        "服务启动完成: port=%d, 账号数=%d",
+        settings.port,
         len(account_store.list_accounts()),
     )
+    logger.debug(
+        "账号列表: %s",
+        [
+            f"{a.id}(u/{a.auth_user},tier={a.tier},enabled={a.enabled})"
+            for a in account_store.list_accounts()
+        ],
+    )
 
-    # 后台预热浏览器，避免首次请求延迟
-    warmup_task = None
-
-    async def _warmup():
-        for attempt in range(3):
-            try:
-                await client.warmup()
-                return
-            except Exception as e:
-                if attempt < 2:
-                    await asyncio.sleep(1.0)
-                    continue
-                logger.warning("浏览器预热失败: %s", e)
-
-    warmup_task = asyncio.create_task(_warmup())
-
-    tier_task = None
-
-    async def _auto_refresh_tiers():
-        import json
+    async def _auto_refresh_tiers() -> None:
+        import httpx
 
         from aistudio_api.infrastructure.account.cookie_parser import (
+            load_cookies_from_auth_file,
             probe_account_benefit_tier,
             probe_account_email,
         )
 
-        for a in account_store.list_accounts():
-            if not a.email or a.tier == "Free":
-                apath = account_store.get_auth_path(a.id)
-                if apath and apath.is_file():
-                    try:
-                        adata = json.loads(apath.read_text(encoding="utf-8"))
-                        rcookies = adata.get("cookies") or []
-                        cdict = {
-                            str(c.get("name") or ""): str(c.get("value") or "")
-                            for c in rcookies
-                            if isinstance(c, dict) and c.get("name")
-                        }
-                        if cdict:
-                            if not a.email:
-                                em = await probe_account_email(
-                                    cdict, auth_user=a.auth_user or "0"
-                                )
-                                if em:
-                                    account_store.update_account_email(a.id, em)
-                            if a.tier == "Free":
-                                t = await probe_account_benefit_tier(
-                                    cdict, auth_user=a.auth_user or "0"
-                                )
-                                if t and t != "Free":
-                                    account_store.update_account_tier(a.id, t)
-                                    logger.info(
-                                        "启动自动校验并升级账号 %s (u/%s) 订阅等级: %s",
-                                        a.id,
-                                        a.auth_user,
-                                        t,
-                                    )
-                    except Exception:
-                        pass
-    tier_task = asyncio.create_task(_auto_refresh_tiers())
+        now_ts = time.time()
+        accounts_to_check = [
+            a
+            for a in account_store.list_accounts()
+            if not a.email
+            or (a.tier_checked_at is None)
+            or (now_ts - (a.tier_checked_at or 0) > 86400 * 3)
+        ]
+        if not accounts_to_check:
+            return
 
-    yield
-    logger.info("服务正在关闭")
-    if warmup_task and not warmup_task.done():
-        warmup_task.cancel()
-    if tier_task and not tier_task.done():
-        tier_task.cancel()
-    if client:
+        logger.info("校验账号邮箱与订阅等级: 待检测=%d", len(accounts_to_check))
+        upgraded_count = 0
+        checked_count = 0
+        sem = asyncio.Semaphore(4)
+
+        async with httpx.AsyncClient(
+            timeout=8.0,
+            proxy=settings.proxy_url,
+            follow_redirects=True,
+            trust_env=False,
+        ) as probe_client:
+
+            async def _check_one(a):
+                nonlocal checked_count, upgraded_count
+                apath = account_store.get_auth_path(a.id)
+                if not apath:
+                    return
+                async with sem:
+                    try:
+                        cdict = load_cookies_from_auth_file(apath)
+                        if not cdict:
+                            return
+                        if not a.email:
+                            em = await probe_account_email(
+                                cdict,
+                                auth_user=a.auth_user or "0",
+                                client=probe_client,
+                            )
+                            if em:
+                                account_store.update_account_email(a.id, em)
+                        old_tier = a.tier or "Free"
+                        probed_tier = await probe_account_benefit_tier(
+                            cdict,
+                            auth_user=a.auth_user or "0",
+                            client=probe_client,
+                            default=None,
+                        )
+                        if probed_tier is None:
+                            logger.debug(
+                                "账号 %s (u/%s) 订阅等级探测未成功，保留原等级 %s",
+                                a.id,
+                                a.auth_user,
+                                old_tier,
+                            )
+                            return
+                        checked_count += 1
+                        resolved_tier = (
+                            "Ultra_20X"
+                            if old_tier == "Ultra_20X" and probed_tier == "Ultra"
+                            else probed_tier
+                        )
+                        account_store.update_account_tier(
+                            a.id, resolved_tier, checked_at=now_ts
+                        )
+                        if resolved_tier != old_tier:
+                            if old_tier == "Free" and resolved_tier != "Free":
+                                upgraded_count += 1
+                            logger.info(
+                                "账号订阅等级更新: id=%s (u/%s) %s -> %s",
+                                a.id,
+                                a.auth_user,
+                                old_tier,
+                                resolved_tier,
+                            )
+                    except Exception as e:
+                        logger.debug("账号 %s 订阅检测失败: %s", a.id, e)
+
+            await asyncio.gather(*(_check_one(a) for a in accounts_to_check))
+
+        logger.info(
+            "账号校验完成: 已检测=%d, 付费升级=%d",
+            checked_count,
+            upgraded_count,
+        )
+
+    async def _cookie_rotation_loop() -> None:
+        """后台定时轮换账号滚动 Cookie (__Secure-1PSIDTS / SIDCC)，间隔 7 分钟。"""
+        import httpx
+
+        from aistudio_api.infrastructure.account.cookie_parser import (
+            compute_session_anchor,
+            load_cookies_from_auth_file,
+            probe_aistudio_session,
+        )
+
+        await asyncio.sleep(5.0)
+        while True:
+            try:
+                now_ts = time.time()
+                seen_anchors: set[tuple[str, str]] = set()
+                accounts = account_store.list_accounts()
+                async with httpx.AsyncClient(
+                    timeout=15.0,
+                    proxy=settings.proxy_url,
+                    follow_redirects=False,
+                    trust_env=False,
+                ) as rot_client:
+                    for acc in accounts:
+                        if not acc.enabled:
+                            continue
+                        st = rotator.get_account_stats(acc.id)
+                        if st and st.session_expired:
+                            continue
+                        last_rot = acc.last_rotated_at or 0.0
+                        if last_rot and (now_ts - last_rot < 420.0):
+                            continue
+                        apath = account_store.get_auth_path(acc.id)
+                        if not apath:
+                            continue
+                        cdict = load_cookies_from_auth_file(apath)
+                        if not cdict:
+                            continue
+                        # 同源 Cookie 不同导入代际分别轮换，且在异步操作前保存代际。
+                        cookie_id = acc.cookie_id or ""
+                        anchor = compute_session_anchor(cdict)
+                        if anchor:
+                            session_key = (anchor, cookie_id)
+                            if session_key in seen_anchors:
+                                continue
+                            seen_anchors.add(session_key)
+                        before_ts = cdict.get("__Secure-1PSIDTS", "")
+                        rot_res = await account_service.rotate_account_cookies(
+                            acc.id, client.session, client=rot_client
+                        )
+                        if rot_res.get(
+                            "stale"
+                        ) is True or not account_service.is_cookie_generation_current(
+                            acc.id, cookie_id
+                        ):
+                            continue
+                        status_code = rot_res.get("status", 0)
+                        if status_code == 401:
+                            alive, _ = await probe_aistudio_session(
+                                cdict, client=rot_client
+                            )
+                            if not account_service.is_cookie_generation_current(
+                                acc.id, cookie_id
+                            ):
+                                continue
+                            if not alive:
+                                rotator.record_session_expired(acc.id)
+                            continue
+                        new_cdict = rot_res.get("cookies")
+                        after_ts = (
+                            new_cdict.get("__Secure-1PSIDTS", "")
+                            if isinstance(new_cdict, dict)
+                            else ""
+                        )
+                        if (
+                            status_code == 200
+                            and before_ts
+                            and after_ts
+                            and before_ts == after_ts
+                        ):
+                            alive, _ = await probe_aistudio_session(
+                                new_cdict if isinstance(new_cdict, dict) else cdict,
+                                client=rot_client,
+                            )
+                            if not account_service.is_cookie_generation_current(
+                                acc.id, cookie_id
+                            ):
+                                continue
+                            if not alive:
+                                rotator.record_session_expired(acc.id)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("后台 Cookie 轮换巡检异常: %s", e)
+            await asyncio.sleep(60.0)
+
+    tier_task = asyncio.create_task(_auto_refresh_tiers())
+    rotate_task = asyncio.create_task(_cookie_rotation_loop())
+
+    try:
+        yield
+    finally:
+        logger.info("正在关闭服务")
+        for bg_task in (tier_task, rotate_task):
+            bg_task.cancel()
+        await asyncio.gather(tier_task, rotate_task, return_exceptions=True)
         try:
             await client.close()
-        except Exception as e:
-            logger.debug("关闭客户端失败: %s", e)
-    runtime_state.client = None
-    runtime_state.account_service = None
-    runtime_state.rotator = None
+        finally:
+            runtime_state.client = None
+            runtime_state.account_service = None
+            runtime_state.rotator = None
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    from aistudio_api.infrastructure.waa.daemon import (
+        ensure_signer_ready,
+        stop_signer_daemon,
+    )
+    from aistudio_api.infrastructure.warp.manager import warp_manager
+
+    try:
+        # No account probes, cookie rotation, or signing before verified WARP.
+        await warp_manager.start()
+        await asyncio.to_thread(ensure_signer_ready)
+        async with _gateway_lifespan(application):
+            yield
+    finally:
+        stop_signer_daemon()
+        await warp_manager.stop()
 
 
 app = FastAPI(title="AI Studio API", lifespan=lifespan)
 app.include_router(system_public_router)
 app.include_router(system_protected_router, dependencies=[Depends(require_web_auth)])
-app.include_router(accounts_router, prefix="/api", dependencies=[Depends(require_web_auth)])
+app.include_router(
+    accounts_router, prefix="/api", dependencies=[Depends(require_web_auth)]
+)
 app.include_router(accounts_router, dependencies=[Depends(require_web_auth)])
 app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
 app.include_router(models_router, dependencies=[Depends(require_api_key)])
@@ -161,6 +319,27 @@ app.include_router(models_router, dependencies=[Depends(require_api_key)])
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
     code, msg, status_str = classify_gemini_error_payload(exc)
+    if code >= 500:
+        logger.error(
+            "HTTP %d 异常: path=%s, message=%s",
+            code,
+            _request.url.path,
+            msg,
+        )
+    elif code in (401, 403, 429):
+        logger.warning(
+            "HTTP %d: path=%s, message=%s",
+            code,
+            _request.url.path,
+            msg,
+        )
+    else:
+        logger.info(
+            "HTTP %d: path=%s, message=%s",
+            code,
+            _request.url.path,
+            msg,
+        )
     return JSONResponse(
         status_code=code,
         content={
@@ -179,6 +358,7 @@ async def validation_exception_handler(
     _request: Request, exc: RequestValidationError
 ) -> JSONResponse:
     code, msg, status_str = 400, str(exc), "INVALID_ARGUMENT"
+    logger.warning("请求参数校验失败: path=%s, error=%s", _request.url.path, exc)
     return JSONResponse(
         status_code=code,
         content={
@@ -199,18 +379,27 @@ async def logging_and_dump_middleware(request, call_next):
     path = request.url.path
 
     is_static = path.startswith(("/static", "/assets")) or path in ("/favicon.ico",)
-    dump_enabled = is_dump_requests_enabled() and not is_static
+    console_dump = is_dump_requests_enabled() and not is_static
+    file_dump = is_dump_to_file_enabled() and not is_static
+    dump_enabled = console_dump or file_dump
 
     req_id = ""
     body_text = None
     client_str = ""
     headers_dict = None
     query_dict = None
+    req_model: str | None = None
+    if path.startswith("/v1beta/models/"):
+        req_model = path.removeprefix("/v1beta/models/").split(":", 1)[0] or None
+    elif path == "/v1beta/decisions":
+        req_model = "gemini-decision-1"
 
     if dump_enabled:
         req_id = f"req_{secrets.token_hex(4)}"
         client_str = (
-            f"{request.client.host}:{request.client.port}" if request.client else "unknown"
+            f"{request.client.host}:{request.client.port}"
+            if request.client
+            else "unknown"
         )
         headers_dict = dict(request.headers)
         query_dict = dict(request.query_params)
@@ -224,6 +413,11 @@ async def logging_and_dump_middleware(request, call_next):
         response = await call_next(request)
     except Exception as exc:
         elapsed_ms = (time.perf_counter() - start_time) * 1000
+        active_acc = (
+            runtime_state.account_service.get_active_account()
+            if runtime_state.account_service
+            else None
+        )
         if dump_enabled:
             dump_request_exchange(
                 req_id=req_id,
@@ -236,6 +430,11 @@ async def logging_and_dump_middleware(request, call_next):
                 status_code=500,
                 elapsed_ms=elapsed_ms,
                 response_text=f"Internal Server Error (Exception: {exc})",
+                model=req_model,
+                account_id=active_acc.id if active_acc else None,
+                auth_user=active_acc.auth_user if active_acc else None,
+                error_detail=str(exc),
+                emit_console=console_dump,
             )
         else:
             logger.error(
@@ -250,11 +449,77 @@ async def logging_and_dump_middleware(request, call_next):
     elapsed_ms = (time.perf_counter() - start_time) * 1000
     content_type = response.headers.get("content-type", "")
     is_event_stream = "text/event-stream" in content_type
+    is_streaming_resp = (
+        is_event_stream or response.headers.get("x-accel-buffering", "").lower() == "no"
+    )
 
     if dump_enabled:
-        resp_text = None
-        if is_event_stream:
-            resp_text = "(streaming response in progress)"
+        active_acc = (
+            runtime_state.account_service.get_active_account()
+            if runtime_state.account_service
+            else None
+        )
+        req_acc_id = active_acc.id if active_acc else None
+        req_auth_user = active_acc.auth_user if active_acc else None
+
+        if is_streaming_resp:
+            orig_iterator = response.body_iterator
+            captured_chunks: list[bytes] = []
+            captured_size = 0
+            max_capture_bytes = 512 * 1024
+
+            async def _tee_stream():
+                nonlocal captured_size
+                stream_err: str | None = None
+                try:
+                    async for chunk in orig_iterator:
+                        raw_chunk = (
+                            chunk
+                            if isinstance(chunk, bytes)
+                            else str(chunk).encode("utf-8")
+                        )
+                        if captured_size < max_capture_bytes:
+                            remaining = max_capture_bytes - captured_size
+                            captured_chunks.append(raw_chunk[:remaining])
+                            captured_size += len(raw_chunk[:remaining])
+                        yield chunk
+                except Exception as stream_exc:
+                    stream_err = str(stream_exc)
+                    raise
+                finally:
+                    total_ms = (time.perf_counter() - start_time) * 1000
+                    resp_text = b"".join(captured_chunks).decode(
+                        "utf-8", errors="replace"
+                    )
+                    dump_request_exchange(
+                        req_id=req_id,
+                        method=request.method,
+                        url=str(request.url),
+                        client=client_str,
+                        headers=headers_dict or {},
+                        query_params=query_dict or {},
+                        body_text=body_text,
+                        status_code=response.status_code,
+                        elapsed_ms=total_ms,
+                        response_headers=dict(response.headers),
+                        response_text=resp_text or "(empty stream)",
+                        is_stream=is_event_stream,
+                        model=req_model,
+                        account_id=req_acc_id,
+                        auth_user=req_auth_user,
+                        error_detail=stream_err,
+                        emit_console=console_dump,
+                    )
+
+            response.body_iterator = _tee_stream()
+            if not console_dump:
+                logger.info(
+                    "HTTP %s %s -> %d (%.1fms)",
+                    request.method,
+                    path,
+                    response.status_code,
+                    elapsed_ms,
+                )
         else:
             try:
                 # 读取非流式响应体并重构 iterator 以便正常返回给客户端
@@ -270,20 +535,32 @@ async def logging_and_dump_middleware(request, call_next):
             except Exception:
                 resp_text = "(failed to read response body)"
 
-        dump_request_exchange(
-            req_id=req_id,
-            method=request.method,
-            url=str(request.url),
-            client=client_str,
-            headers=headers_dict or {},
-            query_params=query_dict or {},
-            body_text=body_text,
-            status_code=response.status_code,
-            elapsed_ms=elapsed_ms,
-            response_headers=dict(response.headers),
-            response_text=resp_text,
-            is_stream=is_event_stream,
-        )
+            dump_request_exchange(
+                req_id=req_id,
+                method=request.method,
+                url=str(request.url),
+                client=client_str,
+                headers=headers_dict or {},
+                query_params=query_dict or {},
+                body_text=body_text,
+                status_code=response.status_code,
+                elapsed_ms=elapsed_ms,
+                response_headers=dict(response.headers),
+                response_text=resp_text,
+                is_stream=False,
+                model=req_model,
+                account_id=req_acc_id,
+                auth_user=req_auth_user,
+                emit_console=console_dump,
+            )
+            if not console_dump:
+                logger.info(
+                    "HTTP %s %s -> %d (%.1fms)",
+                    request.method,
+                    path,
+                    response.status_code,
+                    elapsed_ms,
+                )
     elif not is_static:
         logger.info(
             "HTTP %s %s -> %d (%.1fms)",
@@ -342,7 +619,9 @@ async def spa_navigation_middleware(request: Request, call_next):
     if is_html_nav and (is_accounts_spa or not is_api) and index_html_path.is_file():
         response = FileResponse(index_html_path)
         response.headers["Vary"] = "Accept"
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Cache-Control"] = (
+            "no-store, no-cache, must-revalidate, max-age=0"
+        )
         return response
 
     response = await call_next(request)
@@ -354,7 +633,9 @@ async def spa_navigation_middleware(request: Request, call_next):
                 response.headers["Vary"] = f"{existing_vary}, Accept"
         else:
             response.headers["Vary"] = "Accept"
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Cache-Control"] = (
+            "no-store, no-cache, must-revalidate, max-age=0"
+        )
 
     return response
 
@@ -365,7 +646,9 @@ async def root_index():
     if index_html_path.is_file():
         response = FileResponse(index_html_path)
         response.headers["Vary"] = "Accept"
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Cache-Control"] = (
+            "no-store, no-cache, must-revalidate, max-age=0"
+        )
         return response
     return JSONResponse({"message": "AI Studio API Web UI"})
 
@@ -375,12 +658,16 @@ def main():
 
     parser = argparse.ArgumentParser(description="AI Studio API Server")
     parser.add_argument("--port", type=int, default=settings.port)
-    parser.add_argument("--browser-port", type=int, default=settings.browser_port)
     args = parser.parse_args()
-
-    runtime_state.browser_port = args.browser_port
 
     import uvicorn
 
-    logger.info("正在启动服务，监听端口 %s", args.port)
-    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")
+    logger.info("启动服务: 监听端口=%d, 日志级别=%s", args.port, get_log_level())
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=args.port,
+        log_level=get_log_level().lower(),
+        log_config=None,
+        access_log=False,
+    )

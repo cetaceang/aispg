@@ -76,12 +76,12 @@ def _to_gemini_model(model_data: Mapping[str, object]) -> GeminiModelResponse:
 async def list_models(
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> GeminiModelListResponse:
-    session = runtime_state.client._session if runtime_state.client else None
+    session = runtime_state.client.session if runtime_state.client else None
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
     discovered = await model_discovery.get_models(session=session)
     models = [_to_gemini_model(item) for item in discovered]
-    logger.info("获取模型列表完成 (共发现 %d 个)", len(models))
+    logger.debug("返回模型列表: count=%d", len(models))
     return GeminiModelListResponse(models=models)
 
 
@@ -90,11 +90,12 @@ async def get_model(
     model_id: str,
     runtime_state: RuntimeState = Depends(get_runtime_state),
 ) -> GeminiModelResponse:
-    session = runtime_state.client._session if runtime_state.client else None
+    session = runtime_state.client.session if runtime_state.client else None
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
     model_info = await model_discovery.get_model_by_id(model_id, session=session)
     if model_info is not None:
-        logger.info("成功获取模型元数据: %s", model_id)
+        logger.debug("返回模型详情: model=%s", model_id)
         return _to_gemini_model(model_info)
+    logger.warning("模型不存在: model=%s", model_id)
     raise HTTPException(status_code=404, detail="Model not found")

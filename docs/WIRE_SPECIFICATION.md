@@ -16,14 +16,14 @@
 - [6. 工具与函数声明 (Tools & Function Calling)](#6-工具与函数声明-tools--function-calling)
   - [6.1 内置工具模板](#61-内置工具模板)
   - [6.2 自定义函数声明 (Function Declarations)](#62-自定义函数声明-function-declarations)
-  - [6.3 结构化 Schema 编码与类型字典](#63-结构化-schema-编码与类型字典)
+  - [6.3 结构化 Schema 完整逆向编码表](#63-结构化-schema-完整逆向编码表)
   - [6.4 工具控制模式 (ToolConfig)](#64-工具控制模式-toolconfig)
 - [7. 响应报文解析与 Token 使用量 (Response & Usage)](#7-响应报文解析与-token-使用量-response--usage)
   - [7.1 响应 Chunk 容器](#71-响应-chunk-容器)
   - [7.2 Candidate 与 Part 字段解析](#72-candidate-与-part-字段解析)
   - [7.3 Token 使用量 (UsageMetadata)](#73-token-使用量-usagemetadata)
   - [7.4 FinishReason 完整状态码映射表](#74-finishreason-完整状态码映射表)
-- [8. 前端逆向新特性与高价值发现](#8-前端逆向新特性与高价值发现)
+- [8. 前端逆向未公开特性参考](#8-前端逆向未公开特性参考)
 ---
 
 ## 1. 协议概览与序列化机制
@@ -51,8 +51,8 @@ Google AI Studio 在 Web 端（`alkalimakersuite-pa.clients6.google.com`）与�
 | **`6`** | Field 7 | `tools` | `list \| null` | 工具声明列表（内置工具与自定义函数） |
 | **`7`** | Field 8 | `evergreen_model_uri` | `string \| null` | 动态常青模型 URI（如 `"models/gemini-..."`） |
 | **`10`** | Field 11 | `request_flag` | `int` | 请求行为标记，固定值 `1` |
-| **`11`** | Field 12 | `cached_content` | `string \| null` | 缓存上下文名称 |
-| **`13`** | Field 14 | `location` | `list \| null` | 用户位置与时区声明，如 `[[null, null, "Asia/Tokyo"], null, 1]` |
+| **`11`** | Field 12 | `session_token` | `string \| null` | 会话续接令牌（如 `"v1_..."`） |
+| **`13`** | Field 14 | `request_context` | `list \| null` | 请求上下文与时区声明，如 `[[null, null, "Asia/Tokyo"], null, 1]` |
 
 ---
 
@@ -85,9 +85,10 @@ Google AI Studio 在 Web 端（`alkalimakersuite-pa.clients6.google.com`）与�
 | **工具调用 (FunctionCall)** | `[..., [name, args_struct, call_id]]` | 请求中位于下标 `10` (Field 11)；响应中主路径位于下标 `3` (Field 4)，变体回退兼容下标 `10` |
 | **工具结果 (FunctionResponse)** | `[..., [name, response_struct, call_id]]` | 请求中位于下标 `11` (Field 12)；响应中主路径位于下标 `4` (Field 5)，变体回退兼容下标 `11` |
 | **资源引用 (FileData)** | `[null, null, null, null, null, ["file_id"]]` | 下标 `5` (Field 6) 为 `[file_id]` |
-| **可执行代码 (ExecutableCode)** | `[..., "print('hello')", ...]` | 下标 `8` (Field 9) 为模型生成的待执行代码脚本源码 |
-| **代码执行结果 (CodeResult)** | `[..., "output: hello", ...]` | 下标 `9` (Field 10) 为代码执行沙箱返回的输出结果 |
+| **可执行代码 (ExecutableCode)** | `[..., [lang_code, "print('hello')"]]` | 下标 `8` (Field 9) 为 `[lang_code, code]`（`1`=PYTHON, `0`=未指定） |
+| **代码执行结果 (CodeResult)** | `[..., [outcome_code, "output: hello"]]` | 下标 `9` (Field 10) 为 `[outcome_code, output]`（`1`=OK, `2`=FAILED, `3`=DEADLINE_EXCEEDED） |
 | **思维签名 (ThoughtSignature)** | 位于任意 Part 的下标 `14` (`part[14] = "signature"`) | Google 官方校验思维链真实性的签名字符串 |
+| **媒体/语音元数据 (Metadata)** | `part[40]` | 下标 `40`：图像/视频携带 `video_metadata`，语音文本携带 `[speaker, style]` |
 
 #### 参数与返回值的 Protobuf 结构体编码 (Struct & Value)
 在 `FunctionCall.args` 与 `FunctionResponse.response` 中，键值数据遵循 `google.protobuf.Struct` 紧凑数组格式：
@@ -117,11 +118,14 @@ Google AI Studio 在 Web 端（`alkalimakersuite-pa.clients6.google.com`）与�
 | **`10`** | `frequency_penalty` | `float \| null` | 频率惩罚系数 |
 | **`11`** | `response_logprobs` | `bool \| null` | 是否返回 Logprobs |
 | **`12`** | `logprobs` | `int \| null` | Logprobs 候选数 |
-| **`14`** | `image_output_mode` | `list[int] \| null` | 生图输出模式：`[2]` (仅图片) 或 `[2, 1]` (图文混合) |
-| **`16`** | `thinking_config` | `list \| null` | 思考模式：`[mode, null, null, level]`（`1`=LOW, `2`=MEDIUM, `3`=HIGH, `4`=MINIMAL） |
+| **`14`** | `image_output_mode` / `response_modalities` | `list[int] \| null` | 输出模态：`[2]` (仅图片)、`[2, 1]` (图文混合)、`[3]` (AUDIO/TTS)、`[4]` (VIDEO)、`[4, 1]` (VIDEO+TEXT) |
+| **`15`** | `speech_config` | `list \| null` | TTS 语音合成配置：`[[[voice_name]], language_code, [null, [[speaker, [[voice_name]]], ...], mode]]` |
+| **`16`** | `thinking_config` | `list \| null` | 思考模式：`[mode, budget, null, level]`（`budget` 为 `thinkingBudget`；`level`：`1`=LOW, `2`=MEDIUM, `3`=HIGH, `4`=MINIMAL） |
 | **`17`** | `media_resolution` | `int \| null` | 多模态输入分辨率：`1`=LOW, `2`=MEDIUM, `3`=HIGH |
+| **`18`** | `seed` | `int \| null` | 随机种子（Field 19） |
+| **`24`** | `video_config` | `list \| null` | 视频生成配置：`[aspect_ratio, duration, resolution]` |
 | **`26`** | `output_resolution` | `list[str] \| null` | 生图分辨率配置，如 `["1:1", "1K"]` |
-
+| **`45`** | `argon_capability_flag` | `object \| null` | Argon 系列专用能力标记（非 Argon 模型发送前清空） |
 ---
 
 ## 5. 安全策略 (SafetySettings)
@@ -257,6 +261,7 @@ Google AI Studio 响应为 Protobuf JSON 数组，每个流式分块或单次响
 ### 7.2 Candidate 与 Part 字段解析
 
 - `chunk[0][0]`：候选回答对象（Candidate）；
+- `chunk[1]`：PromptFeedback 数组 `[blockReason, safetyRatings, blockReasonMessage]`（当 Candidate 缺失 `finish_reason` 时回退映射 `blockReason`）；
 - `candidate[0]`：结构化内容 `[parts_list, role]`；
 - `candidate[1]`：FinishReason 代码（`1` 对应 STOP）；
 - `candidate[3]`：FinishMessage 说明；
@@ -305,8 +310,8 @@ Google AI Studio 响应为 Protobuf JSON 数组，每个流式分块或单次响
 | `2` | `MAX_TOKENS` | 达到最大输出 Token 上限 |
 | `3` | `SAFETY` | 触发安全过滤策略拦截 |
 | `4` | `RECITATION` | 触发版权/原文背诵拦截 |
-| `5` | `LANGUAGE` | 不支持的语言策略拦截 |
-| `6` | `OTHER` | 其他终止原因 |
+| `5` | `OTHER` | 其他终止原因 |
+| `6` | `LANGUAGE` | 不支持的语言策略拦截 |
 | `7` | `BLOCKLIST` | 触发禁用词黑名单 |
 | `8` | `PROHIBITED_CONTENT` | 触发违规有害内容拦截 |
 | `9` | `SPII` | 敏感个人身份信息拦截 |
@@ -315,10 +320,11 @@ Google AI Studio 响应为 Protobuf JSON 数组，每个流式分块或单次响
 | `12` | `UNEXPECTED_TOOL_CALL` | 意外的工具调用 |
 | `13` | `TOO_MANY_TOOL_CALLS` | 工具链连续调用超限退出 |
 | `14` | `IMAGE_PROHIBITED_CONTENT` | 图片包含违规内容 |
-| `15` | `NO_IMAGE` | 预期生图但未生成 |
-| `16` | `IMAGE_RECITATION` | 生图版权来源相似度拦截 |
-| `17` | `IMAGE_OTHER` | 生图其他未知原因终止 |
-
+| `15` | `IMAGE_OTHER` | 生图其他未知原因终止 |
+| `16` | `NO_IMAGE` | 预期生图但未生成 |
+| `17` | `IMAGE_RECITATION` | 生图版权来源相似度拦截 |
+| `18` | `MISSING_THOUGHT_SIGNATURE` | 缺少有效的思维签名 |
+| `22` | `CONTINUING` (非终止) | 流式长输出续页中，网关忽略该中间码继续接收后续分块 |
 AI Studio Web 核心过滤数组：
 `hCb = [0, 3, 4, 5, 7, 8, 9, 11, 14, 15, 17]`
 前端逻辑中 `1` (`STOP`) 与 `2` (`MAX_TOKENS`) 视为常规完成，其余在 `hCb` 中的代码均触发错误或警告弹窗处理。
@@ -327,21 +333,17 @@ AI Studio Web 核心过滤数组：
 
 ## 8. 前端逆向未公开特性参考
 
-通过对 AI Studio 前端代码包（`m=_b.js`）的 AST 逆向分析，整理以下协议特性与未公开接口参考：
-1. **原生 MCP (Model Context Protocol) 支持**：
-   前端 `toolType` 解析中内置 `mcp_server_tool_call`（枚举代码 `6`），表明 Google 正在或已在 AI Studio 底层协议中预留了连接本地/远程 MCP Server 的标准工具通道。
-2. **原生文件检索工具 (`file_search`)**：
-   工具分支代码中存在 `case 8: return "file_search"` 与 `file_search_call`，区别于传统的代码执行与普通检索，属于针对多文档的大规模知识库检索能力。
+通过对 AI Studio 前端代码包（`m=_b.js`）的 AST 分析，记录以下协议字段与枚举定义：
+1. **MCP (Model Context Protocol) 工具枚举**：
+   前端 `toolType` 分支包含 `mcp_server_tool_call`（枚举值 `6`）。
+2. **文件检索工具 (`file_search`)**：
+   工具分支包含 `case 8: return "file_search"` 与 `file_search_call`。
 3. **语音自定义词汇表 (`customVocabulary`)**：
-   GenerationConfig 字段 32（`_.cu` / Field 32）下支持向语音端点下发专属专业术语、专有名词与人名词典，用于提升音频转录与识别精度。
-4. **音频高级控制标记**：
-   - `wordTimestamps`：字级别（Word-level）输出时间戳；
-   - `speakerDiarization`：多说话人角色分离与标签标记；
-   - `smartTranscription`：去除口语赘字（Filler words）、自动语法重构与口误纠正；
-   - `fillerWords`：允许自然停顿与语气词（"hmm", "ahh"）。
-5. **视频帧流式抽取服务 (`StreamExtractVideoFrames`)**：
-   RPC 服务 `/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/StreamExtractVideoFrames`，用于在后端按时间戳或指定采样率无损切片视频流并回传图片帧。
-
+   GenerationConfig Field 32（`_.cu`）用于传递音频转录自定义词汇表。
+4. **音频控制标记**：
+   包含 `wordTimestamps`（字级时间戳）、`speakerDiarization`（说话人分离）、`smartTranscription` 与 `fillerWords`。
+5. **视频帧抽取服务 (`StreamExtractVideoFrames`)**：
+   RPC 路径 `/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/StreamExtractVideoFrames`。
 ### 8.1 前端 JS (JSPB) 工具调用参数压缩机制与解包原则
 
 根据对 AI Studio 前端生产包动态逆向分析，Google 前端在处理 `FunctionCall.args` 与 JSON Schema 时存在特定的 JSPB 优化机制：

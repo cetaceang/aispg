@@ -1,18 +1,21 @@
 services:
   aistudio-api:
     build: .
+    image: ${AISTUDIO_IMAGE:-ghcr.io/cetaceang/aispg:latest}
     container_name: aistudio-api
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      AISTUDIO_WARP_ENABLED: ${AISTUDIO_WARP_ENABLED:-1}
     ports:
       - "${AISTUDIO_BIND_ADDRESS:-127.0.0.1}:${AISTUDIO_PORT:-8080}:${AISTUDIO_PORT:-8080}"
     volumes:
       - ./data:/app/data           # Account data, stats.json and rotator_state.json persistence
       - ./config.yaml:/app/data/config.yaml  # Model configuration file
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:$${AISTUDIO_PORT:-8080}/v1beta/models || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:$${AISTUDIO_PORT:-8080}/health || exit 1"]
       interval: 30s
       timeout: 10s
-      start_period: 10s
+      start_period: 120s
       retries: 3

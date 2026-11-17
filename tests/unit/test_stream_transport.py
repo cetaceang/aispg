@@ -1,190 +1,126 @@
-"""Unit tests for XHRStreamTransport and CDP native stream binding."""
+"""Unit tests for HTTPStreamTransport."""
 
 from __future__ import annotations
 
-import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock
+from collections.abc import AsyncGenerator
 
+import httpx
 import pytest
 
-from aistudio_api.infrastructure.browser.cdp_client import CDPPage
-from aistudio_api.infrastructure.browser.scripts import (
-    STREAM_CLEANUP_JS,
-    STREAMING_INIT_JS,
-)
-from aistudio_api.infrastructure.gateway.transport import XHRStreamTransport
-
-
-def test_streaming_scripts_defined_and_non_empty():
-    """Verify streaming initialization and cleanup scripts are properly loaded."""
-    assert len(STREAMING_INIT_JS.strip()) > 0
-    assert len(STREAM_CLEANUP_JS.strip()) > 0
-    assert "__AISTUDIO__" in STREAMING_INIT_JS
-    assert "__AISTUDIO__" in STREAM_CLEANUP_JS
+from aistudio_api.domain.errors import TransportError
+from aistudio_api.infrastructure.gateway.client import PreparedRequest
+from aistudio_api.infrastructure.gateway.streaming import StreamingGateway
+from aistudio_api.infrastructure.gateway.transport import HTTPStreamTransport
 
 
 @pytest.mark.asyncio
-async def test_transport_native_cdp_binding_stream_push():
-    """Verify realtime stream event dispatch via CDP Runtime.bindingCalled."""
-    transport = XHRStreamTransport()
-    page = MagicMock(spec=CDPPage)
-    binding_listener = None
+async def test_transport_non_streaming_request():
+    """Verify non-streaming HTTP POST request."""
+    transport = HTTPStreamTransport()
 
-    def mock_on_binding(name: str, callback):
-        nonlocal binding_listener
-        if name == "__aistudio_stream_push__":
-            binding_listener = callback
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b'["response data"]')
 
-    page.on_binding = MagicMock(side_effect=mock_on_binding)
-    page.add_binding = AsyncMock()
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport._client = mock_client
 
-    captured_rid = None
+    status, body = await transport.send_request(
+        url="https://example.com/api",
+        headers={"Content-Type": "application/json"},
+        body="{}",
+    )
 
-    async def fake_evaluate(expr, args=None, *a, **kw):
-        nonlocal captured_rid
-        if isinstance(args, dict) and "rid" in args:
-            captured_rid = args["rid"]
-        return
+    assert status == 200
+    assert body == b'["response data"]'
 
-    page.evaluate = AsyncMock(side_effect=fake_evaluate)
 
-    async def push_events():
-        while captured_rid is None or binding_listener is None:
-            await asyncio.sleep(0.01)
+@pytest.mark.asyncio
+async def test_transport_streaming_request():
+    """Verify streaming HTTP POST chunks."""
+    transport = HTTPStreamTransport()
 
-        binding_listener(
-            json.dumps({"rid": captured_rid, "type": "status", "status": 200})
-        )
-        binding_listener(
-            json.dumps({"rid": captured_rid, "type": "chunk", "text": "Hello "})
-        )
-        binding_listener(
-            json.dumps({"rid": captured_rid, "type": "chunk", "text": "CDP Binding!"})
-        )
-        binding_listener(json.dumps({"rid": captured_rid, "type": "done"}))
+    def handler(request: httpx.Request) -> httpx.Response:
+        async def stream():
+            yield b"chunk1"
+            yield b"chunk2"
 
-    push_task = asyncio.create_task(push_events())
+        return httpx.Response(200, content=stream())
 
-    collected = []
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport._client = mock_client
+
+    events = []
     async for tag, payload in transport.send_streaming_request(
-        page,
-        url="http://test.com",
+        url="https://example.com/stream",
         headers={},
         body="{}",
-        timeout_ms=3000,
     ):
-        collected.append((tag, payload))
+        events.append((tag, payload))
 
-    await push_task
-
-    assert ("status", 200) in collected
-    assert ("chunk", b"Hello ") in collected
-    assert ("chunk", b"CDP Binding!") in collected
+    assert ("status", 200) in events
+    assert ("chunk", b"chunk1") in events
+    assert ("chunk", b"chunk2") in events
 
 
 @pytest.mark.asyncio
-async def test_transport_streaming_timeout_raises():
-    """Verify stream timeout before completion explicitly raises TimeoutError."""
-    transport = XHRStreamTransport()
-    page = MagicMock(spec=CDPPage)
-    binding_listener = None
+async def test_transport_error_handling():
+    """Verify non-streaming HTTP failure raises TransportError."""
+    transport = HTTPStreamTransport()
 
-    def mock_on_binding(name: str, callback):
-        nonlocal binding_listener
-        if name == "__aistudio_stream_push__":
-            binding_listener = callback
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("Connection refused")
 
-    page.on_binding = MagicMock(side_effect=mock_on_binding)
-    page.add_binding = AsyncMock()
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport._client = mock_client
 
-    captured_rid = None
-
-    async def fake_evaluate(expr, args=None, *a, **kw):
-        nonlocal captured_rid
-        if isinstance(args, dict) and "rid" in args:
-            captured_rid = args["rid"]
-        return
-
-    page.evaluate = AsyncMock(side_effect=fake_evaluate)
-
-    async def push_status_only():
-        while captured_rid is None or binding_listener is None:
-            await asyncio.sleep(0.01)
-        binding_listener(
-            json.dumps({"rid": captured_rid, "type": "status", "status": 200})
+    with pytest.raises(TransportError, match="HTTP request failed"):
+        await transport.send_request(
+            url="https://example.com/fail",
+            headers={},
+            body="{}",
         )
 
-    push_task = asyncio.create_task(push_status_only())
-    with pytest.raises(
-        TimeoutError, match="streaming response timed out before completion"
-    ):
-        async for _ in transport.send_streaming_request(
-            page,
-            url="http://test.com",
-            headers={},
-            body="{}",
-            timeout_ms=100,
-        ):
-            pass
-    await push_task
-
 
 @pytest.mark.asyncio
-async def test_transport_abort_stream_by_rid():
-    """Verify abort_stream targets specific active stream by rid without disturbing other streams."""
-    transport = XHRStreamTransport()
-    page = MagicMock(spec=CDPPage)
-    page.on_binding = MagicMock()
-    page.add_binding = AsyncMock()
+async def test_streaming_gateway_split_utf8_chunks():
+    """Verify that multi-byte UTF-8 characters split across byte chunks are not corrupted into replacement characters."""
 
-    captured_rids: list[str] = []
+    class MockSession:
+        async def send_streaming_request(
+            self, **kwargs: object
+        ) -> AsyncGenerator[tuple[str, object], None]:
+            yield ("status", 200)
+            text_content = (
+                "嗨！我是你的酒馆工程搭档。平时在这套工作区里，一起搞的事情挺多的：🎉🚀"
+            )
+            chunk_data = [
+                [[[[[None, text_content]], "model"]]],
+                None,
+                [5, None, 19],
+                None,
+                None,
+                None,
+                None,
+                "resp_123",
+            ]
+            full_raw = (")]}'\n[[ " + json.dumps(chunk_data) + " ]]").encode("utf-8")
+            # Intentionally split into 3-byte chunks to cut Chinese characters and 4-byte emojis mid-character
+            for i in range(0, len(full_raw), 3):
+                yield ("chunk", full_raw[i : i + 3])
 
-    async def fake_evaluate(expr, args=None, *a, **kw):
-        if isinstance(args, dict) and "rid" in args:
-            captured_rids.append(args["rid"])
-        return
-
-    page.evaluate = AsyncMock(side_effect=fake_evaluate)
-
-    assert transport.in_flight_count == 0
-
-    async def run_stream():
-        async for _ in transport.send_streaming_request(
-            page,
-            url="http://test.com",
-            headers={},
-            body="{}",
-            timeout_ms=5000,
-        ):
-            pass
-
-    task1 = asyncio.create_task(run_stream())
-    task2 = asyncio.create_task(run_stream())
-    await asyncio.sleep(0.05)
-    assert transport.in_flight_count == 2
-    assert len(captured_rids) == 2
-
-    # Abort unknown rid returns False
-    assert transport.abort_stream("non_existent_rid") is False
-    assert transport.in_flight_count == 2
-
-    # Abort stream 1 specifically
-    rid1 = captured_rids[0]
-    assert transport.abort_stream(rid1, "client_disconnected") is True
-
-    with pytest.raises(
-        RuntimeError, match="streaming request failed: client_disconnected"
+    gateway = StreamingGateway(session=MockSession())  # type: ignore[arg-type]
+    prepared = PreparedRequest(url="https://example.com", headers={}, body="{}")
+    results: list[str] = []
+    async for event_type, val in gateway.stream_chat(
+        request=prepared, model="models/gemini-2.5-flash"
     ):
-        await task1
+        if event_type == "body" and isinstance(val, str):
+            results.append(val)
 
-    assert transport.in_flight_count == 1
-
-    # Close transport interrupts remaining stream 2
-    transport.close("transport_closed")
-    with pytest.raises(
-        RuntimeError, match="streaming request failed: transport_closed"
-    ):
-        await task2
-
-    assert transport.in_flight_count == 0
+    joined = "".join(results)
+    assert (
+        joined
+        == "嗨！我是你的酒馆工程搭档。平时在这套工作区里，一起搞的事情挺多的：🎉🚀"
+    )
+    assert "\ufffd" not in joined

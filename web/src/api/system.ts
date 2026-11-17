@@ -10,10 +10,18 @@ import type {
   UpdateLoggingConfigRequest,
   UpdateLoggingConfigResponse,
   HealthCheckResponse,
+  EgressResponse,
+  SignerServerItem,
+  SignerServersResponse,
+  TestSignerServerResponse,
 } from '@/types'
+import type { SystemConfigDefaults } from '@/components/config/types.ts'
 
 
 export const systemApi = {
+  getEgress(): Promise<EgressResponse> {
+    return request<EgressResponse>('/network/egress')
+  },
   health(): Promise<HealthCheckResponse> {
     return request<HealthCheckResponse>('/health')
   },
@@ -47,6 +55,10 @@ export const systemApi = {
 
   getConfig(): Promise<SystemConfig> {
     return request<SystemConfig>('/config')
+  },
+
+  getConfigDefaults(): Promise<SystemConfigDefaults> {
+    return request<SystemConfigDefaults>('/config/defaults')
   },
 
   updateConfigYaml(yamlContent: string): Promise<{ ok: boolean; message: string }> {
@@ -84,6 +96,37 @@ export const systemApi = {
     return request<ApiKeyItem>(`/api-keys/${encodeURIComponent(keyValue)}`, {
       method: 'PUT',
       body: JSON.stringify(req),
+    })
+  },
+
+  getSignerServers(): Promise<SignerServersResponse> {
+    return request<SignerServersResponse>('/config/signer-servers')
+  },
+
+  switchSignerServer(serverId: string): Promise<{ ok: boolean; active_server: SignerServerItem }> {
+    return request('/config/signer-servers/switch', {
+      method: 'POST',
+      body: JSON.stringify({ server_id: serverId }),
+    })
+  },
+
+  upsertSignerServer(server: Partial<SignerServerItem>): Promise<{ ok: boolean; server: SignerServerItem }> {
+    return request('/config/signer-servers', {
+      method: 'PUT',
+      body: JSON.stringify(server),
+    })
+  },
+
+  deleteSignerServer(serverId: string): Promise<{ ok: boolean }> {
+    return request(`/config/signer-servers/${encodeURIComponent(serverId)}`, {
+      method: 'DELETE',
+    })
+  },
+
+  testSignerServer(url: string): Promise<TestSignerServerResponse> {
+    return request('/config/signer-servers/test', {
+      method: 'POST',
+      body: JSON.stringify({ url }),
     })
   },
 }

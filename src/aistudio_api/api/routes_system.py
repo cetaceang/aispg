@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import time
 from typing import TYPE_CHECKING
 
 import yaml
@@ -16,6 +17,7 @@ from aistudio_api.api.response_models import (
     StatsResponse,
     StatsTotalsResponse,
 )
+from aistudio_api.config import settings
 from aistudio_api.infrastructure.gateway.model_defaults import (
     _resolve_config_path,
     invalidate_config_cache,
@@ -32,13 +34,21 @@ protected_router = APIRouter()
 
 
 def health_response() -> HealthResponse:
-    return HealthResponse(status="ok", busy=False)
+    return HealthResponse(status="ok")
 
 
 def stats_response() -> StatsResponse:
+    from aistudio_api.api.response_models import AccountBreakdownItem
     from aistudio_api.api.state import runtime_state
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        resolve_tier_quota_limits,
+    )
 
     stats = dict(runtime_state.model_stats)
+    rotator = runtime_state.rotator
+    account_svc = runtime_state.account_service
+    accounts_list = account_svc.list_accounts() if account_svc else []
+
     totals = StatsTotalsResponse(
         requests=sum(s.requests for s in stats.values()),
         success=sum(s.success for s in stats.values()),
@@ -46,27 +56,111 @@ def stats_response() -> StatsResponse:
         errors=sum(s.errors for s in stats.values()),
         prompt_tokens=sum(s.prompt_tokens for s in stats.values()),
         completion_tokens=sum(s.completion_tokens for s in stats.values()),
+        reasoning_tokens=sum(s.reasoning_tokens for s in stats.values()),
+        cached_tokens=sum(s.cached_tokens for s in stats.values()),
         total_tokens=sum(s.total_tokens for s in stats.values()),
     )
-    models = {
-        name: ModelStatsResponse(
+
+    models = {}
+    for name, s in stats.items():
+        clean_m = name.removeprefix("models/").lower()
+        breakdown: list[AccountBreakdownItem] = []
+
+        if rotator:
+            from aistudio_api.application.account_rotator import get_pacific_date_key
+
+            current_la = get_pacific_date_key()
+            for acc in accounts_list:
+                st = rotator.get_account_stats(acc.id)
+                if st:
+                    st._check_date_reset(current_la)
+                    if clean_m in st.daily_models:
+                        m_daily = st.daily_models[clean_m]
+                        limits = resolve_tier_quota_limits(acc.tier, clean_m)
+                        quota = limits.daily_limit
+                        token_quota = limits.daily_token_limit
+                        req_pct = round((m_daily.requests / max(1, quota)) * 100, 1)
+                        tok_pct = (
+                            round((m_daily.total_tokens / token_quota) * 100, 1)
+                            if token_quota and token_quota > 0
+                            else 0.0
+                        )
+                        used_pct = max(req_pct, tok_pct)
+                        cd_rem = (
+                            max(0, int(m_daily.cooldown_until - time.time()))
+                            if m_daily.cooldown_until > time.time()
+                            else 0
+                        )
+                        breakdown.append(
+                            AccountBreakdownItem(
+                                account_id=acc.id,
+                                name=acc.name,
+                                auth_user=acc.auth_user,
+                                email=acc.email,
+                                tier=acc.tier,
+                                group=acc.group,
+                                enabled=acc.enabled,
+                                today_requests=m_daily.requests,
+                                today_success=m_daily.success,
+                                today_rate_limited=m_daily.rate_limited,
+                                today_tokens=m_daily.total_tokens,
+                                today_reasoning_tokens=m_daily.reasoning_tokens,
+                                configured_quota=quota,
+                                configured_token_quota=token_quota,
+                                quota_used_percent=used_pct,
+                                token_quota_used_percent=tok_pct,
+                                is_available=acc.enabled
+                                and cd_rem == 0
+                                and not st.session_expired,
+                                cooldown_remaining=cd_rem,
+                            )
+                        )
+
+        models[name] = ModelStatsResponse(
             requests=s.requests,
             success=s.success,
             rate_limited=s.rate_limited,
             errors=s.errors,
             prompt_tokens=s.prompt_tokens,
             completion_tokens=s.completion_tokens,
+            reasoning_tokens=s.reasoning_tokens,
+            cached_tokens=s.cached_tokens,
             total_tokens=s.total_tokens,
+            finish_reasons=dict(s.finish_reasons),
             last_used=s.last_used,
+            account_breakdown=breakdown,
         )
-        for name, s in stats.items()
-    }
     return StatsResponse(models=models, totals=totals)
 
 
 @public_router.get("/health", response_model=HealthResponse)
 async def health():
+    from aistudio_api.infrastructure.warp.manager import warp_manager
+
+    if warp_manager.enabled and (
+        warp_manager.process is None or warp_manager.process.returncode is not None
+    ):
+        raise HTTPException(503, detail="Embedded WARP process is not running")
     return health_response()
+
+
+@protected_router.get("/network/egress")
+async def network_egress() -> dict[str, object]:
+    """Actively prove the application's WARP egress, not just an open port."""
+    from aistudio_api.infrastructure.warp.manager import warp_manager
+
+    if not warp_manager.enabled:
+        return {
+            "enabled": False,
+            "mode": "external_proxy" if settings.proxy_url else "direct",
+        }
+    if warp_manager.process is None or warp_manager.process.returncode is not None:
+        raise HTTPException(503, detail="Embedded WARP process is not running")
+    try:
+        trace = await warp_manager.verify()
+    except Exception as exc:
+        raise HTTPException(503, detail="WARP egress verification failed") from exc
+    return {"enabled": True, "mode": "warp", **trace}
 
 
 @protected_router.get("/stats", response_model=StatsResponse)
@@ -117,7 +211,11 @@ async def clear_cooldown(
         rotator.clear_cooldown(req.account_id, model=req.model)
     else:
         rotator.clear_all_cooldowns()
-    logger.info("已清除冷却锁定: 账号=%s, 模型=%s", req.account_id, req.model)
+    logger.info(
+        "已清除冷却状态: 账号=%s, 模型=%s",
+        req.account_id or "全部",
+        req.model or "全部",
+    )
 
     return {"ok": True, "accounts": rotator.get_all_stats()}
 
@@ -168,18 +266,18 @@ async def force_next_account(
     account_service = runtime_state.account_service
     client = runtime_state.client
 
-    if account_service is None or client is None or client._session is None:
+    if account_service is None or client is None or client.session is None:
         raise HTTPException(503, detail="服务未就绪")
 
     result = await account_service.activate_account(
         next_account.id,
-        client._session,
+        client.session,
     )
 
     if result is None:
         raise HTTPException(500, detail="切换失败")
 
-    logger.info("已强制切换至下一可用账号: %s (%s)", result.id, result.name)
+    logger.info("手动切换至下一账号: id=%s, name=%s", result.id, result.name)
     return {
         "ok": True,
         "account": {
@@ -214,13 +312,17 @@ async def get_system_config() -> dict[str, object]:
     if config_yaml_path.exists():
         with contextlib.suppress(Exception):
             yaml_content = config_yaml_path.read_text(encoding="utf-8")
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_active_waa_server,
+    )
+
+    active_waa = get_active_waa_server()
     return {
         "port": settings.port,
-        "browser_port": settings.browser_port,
-        "browser_headless": settings.browser_headless,
+        "proof_server_url": str(active_waa.get("url") or settings.proof_server_url),
+        "active_signer_server": active_waa.get("id"),
         "proxy_configured": bool(settings.proxy_url),
         "auth_enabled": settings.auth_enabled,
-        "timeout_stream": settings.timeout_stream,
         "yaml_content": yaml_content,
         "log_level": get_log_level(),
         "dump_requests": is_dump_requests_enabled(),
@@ -228,6 +330,16 @@ async def get_system_config() -> dict[str, object]:
         "dump_to_file": is_dump_to_file_enabled(),
         "dump_dir": str(get_dump_dir()),
     }
+
+
+@protected_router.get("/config/defaults")
+async def get_system_config_defaults() -> dict[str, object]:
+    """获取系统内置推荐默认配置（订阅额度、付费准入规则、调度策略、模型规则）。"""
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_default_config_sections,
+    )
+
+    return get_default_config_sections()
 
 
 @protected_router.put("/config/yaml")
@@ -240,33 +352,184 @@ async def update_config_yaml(req: ConfigYamlUpdateRequest) -> dict[str, object]:
             raise HTTPException(400, detail="YAML 顶层必须为字典结构")
     except yaml.YAMLError as e:
         raise HTTPException(400, detail=f"YAML 语法格式错误: {e}") from e
+    if isinstance(parsed, dict):
+        from aistudio_api.infrastructure.gateway.model_defaults import (
+            validate_config_sections,
+        )
+
+        try:
+            validate_config_sections(parsed)
+        except ValueError as e:
+            raise HTTPException(400, detail=f"配置校验失败: {e}") from e
     config_yaml_path = _resolve_config_path(None)
     try:
         config_yaml_path.write_text(req.yaml_content, encoding="utf-8")
         invalidate_config_cache()
 
-        if isinstance(parsed, dict) and "logging" in parsed:
-            raw_logging = parsed["logging"]
-            if isinstance(raw_logging, dict):
-                from aistudio_api.infrastructure.utils.logger import (
-                    set_dump_dir,
-                    set_dump_requests,
-                    set_dump_to_file,
-                    set_log_level,
-                )
+        if isinstance(parsed, dict):
+            from aistudio_api.infrastructure.gateway.model_defaults import (
+                get_configured_logging_settings,
+            )
+            from aistudio_api.infrastructure.utils.logger import (
+                set_dump_dir,
+                set_dump_requests,
+                set_dump_to_file,
+                set_log_level,
+            )
 
-                if "level" in raw_logging:
-                    set_log_level(str(raw_logging["level"]))
-                if "dump_requests" in raw_logging:
-                    set_dump_requests(bool(raw_logging["dump_requests"]))
-                if "dump_to_file" in raw_logging:
-                    set_dump_to_file(bool(raw_logging["dump_to_file"]))
-                if "dump_dir" in raw_logging:
-                    set_dump_dir(str(raw_logging["dump_dir"]))
-        logger.info("配置文件 config.yaml 已更新并重新加载")
+            log_cfg = get_configured_logging_settings()
+            raw_logging = (
+                parsed["logging"] if isinstance(parsed.get("logging"), dict) else {}
+            )
+            set_log_level(str(log_cfg.get("level", "INFO")))
+            set_dump_requests(
+                bool(raw_logging["dump_requests"])
+                if "dump_requests" in raw_logging
+                else None
+            )
+            set_dump_to_file(
+                bool(raw_logging["dump_to_file"])
+                if "dump_to_file" in raw_logging
+                else None
+            )
+            set_dump_dir(
+                str(raw_logging["dump_dir"]) if "dump_dir" in raw_logging else None
+            )
+        logger.info("已更新并重载 config.yaml")
         return {"ok": True, "message": "配置已保存并重载"}
     except Exception as e:
         raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
+
+
+# ========== WAA 签名服务器管理与纯手动切换 API ==========
+
+
+class SwitchSignerServerRequest(BaseModel):
+    server_id: str
+
+
+class UpsertSignerServerRequest(BaseModel):
+    id: str | None = None
+    name: str
+    description: str = ""
+    url: str
+    user_agent: str = ""
+    headers: dict[str, str] = {}
+
+
+class TestSignerServerRequest(BaseModel):
+    url: str
+
+
+@protected_router.get("/config/signer-servers")
+async def get_signer_servers() -> dict[str, object]:
+    """获取所有配置的 WAA 签名服务器列表及当前激活项。"""
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_configured_waa_settings,
+    )
+
+    waa = get_configured_waa_settings()
+    active_id = str(waa.get("active_server") or "local_spidermonkey").strip()
+    raw_servers = waa.get("servers")
+    servers = raw_servers if isinstance(raw_servers, list) else []
+
+    result_servers = []
+    for s in servers:
+        if isinstance(s, dict):
+            s_id = str(s.get("id") or "").strip()
+            item = dict(s)
+            item["is_active"] = s_id == active_id
+            result_servers.append(item)
+
+    return {
+        "active_server": active_id,
+        "servers": result_servers,
+    }
+
+
+@protected_router.post("/config/signer-servers/switch")
+async def switch_signer_server(req: SwitchSignerServerRequest) -> dict[str, object]:
+    """纯手动切换当前激活的 WAA 签名服务器。"""
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        switch_active_waa_server,
+    )
+
+    active = switch_active_waa_server(req.server_id)
+    logger.info(
+        "切换 WAA 签名服务: id=%s, url=%s",
+        active.get("id"),
+        active.get("url"),
+    )
+    return {"ok": True, "active_server": active}
+
+
+@protected_router.put("/config/signer-servers")
+async def upsert_signer_server(req: UpsertSignerServerRequest) -> dict[str, object]:
+    """添加或修改 WAA 签名服务器配置。"""
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        upsert_waa_server,
+    )
+
+    server_data = req.model_dump(exclude_none=True)
+    saved = upsert_waa_server(server_data)
+    logger.info(
+        "保存 WAA 签名服务器配置: id=%s, name=%s",
+        saved.get("id"),
+        saved.get("name"),
+    )
+    return {"ok": True, "server": saved}
+
+
+@protected_router.delete("/config/signer-servers/{server_id}")
+async def delete_signer_server(server_id: str) -> dict[str, bool]:
+    """删除指定的 WAA 签名服务器。"""
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        delete_waa_server,
+    )
+
+    success = delete_waa_server(server_id)
+    if not success:
+        raise HTTPException(404, detail="未找到该签名服务器")
+    logger.info("删除 WAA 签名服务器: id=%s", server_id)
+    return {"ok": True}
+
+
+@protected_router.post("/config/signer-servers/test")
+async def test_signer_server(req: TestSignerServerRequest) -> dict[str, object]:
+    """测试指定签名服务的连通性与健康状态。"""
+    import time
+
+    import httpx
+
+    from aistudio_api.config import settings
+    from aistudio_api.infrastructure.waa.signer import is_local_signer
+
+    target_url = req.url.rstrip("/")
+    is_local = is_local_signer(target_url)
+    proxy = None if is_local else settings.proxy_url
+
+    t0 = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(
+            timeout=8.0, proxy=proxy, trust_env=False
+        ) as client:
+            resp = await client.get(f"{target_url}/health")
+            elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+            is_ok = resp.status_code == 200
+            data = resp.json() if is_ok else {}
+            return {
+                "ok": is_ok,
+                "status_code": resp.status_code,
+                "elapsed_ms": elapsed_ms,
+                "data": data,
+            }
+    except Exception as e:
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+        return {
+            "ok": False,
+            "error": str(e),
+            "elapsed_ms": elapsed_ms,
+        }
 
 
 class LoggingConfigRequest(BaseModel):
@@ -311,12 +574,11 @@ async def update_logging_config(req: LoggingConfigRequest) -> dict[str, object]:
     )
     logger.info(
         "日志配置已更新: 级别=%s, 请求转储=%s, 文件转储=%s, 目录=%s",
-        req.level,
-        req.dump_requests,
-        req.dump_to_file,
-        req.dump_dir,
+        get_log_level(),
+        is_dump_requests_enabled(),
+        is_dump_to_file_enabled(),
+        get_dump_dir(),
     )
-
     return {
         "ok": True,
         "log_level": get_log_level(),
@@ -408,11 +670,11 @@ async def create_api_key(req: CreateApiKeyRequest) -> ApiKeyItemModel:
     )
     invalidate_config_cache()
 
-    logger.info("已创建新 API Key: 备注=%s, 密钥=%s", name, new_key[:8] + "...")
+    logger.info("创建 API Key: 备注=%s, 前缀=%s", name, new_key[:8] + "...")
     return ApiKeyItemModel(name=name, key=new_key, created_at=created_at)
 
 
-@protected_router.delete("/api-keys/{key_value}")
+@protected_router.delete("/api-keys/{key_value:path}")
 async def delete_api_key(key_value: str) -> dict[str, bool]:
     """在 config.yaml 中删除指定 API Key。"""
 
@@ -451,11 +713,11 @@ async def delete_api_key(key_value: str) -> dict[str, bool]:
     )
     invalidate_config_cache()
 
-    logger.info("已删除 API Key: %s", key_value[:8] + "...")
+    logger.info("删除 API Key: 前缀=%s", key_value[:8] + "...")
     return {"ok": True}
 
 
-@protected_router.put("/api-keys/{key_value}", response_model=ApiKeyItemModel)
+@protected_router.put("/api-keys/{key_value:path}", response_model=ApiKeyItemModel)
 async def update_api_key_name(
     key_value: str, req: UpdateApiKeyRequest
 ) -> ApiKeyItemModel:
@@ -499,6 +761,6 @@ async def update_api_key_name(
         yaml.dump(parsed, allow_unicode=True, sort_keys=False), encoding="utf-8"
     )
     invalidate_config_cache()
-    logger.info("API Key 备注名已更新: %s -> %s", key_value[:8] + "...", new_name)
+    logger.info("更新 API Key 备注: 前缀=%s, 备注=%s", key_value[:8] + "...", new_name)
 
     return updated_item

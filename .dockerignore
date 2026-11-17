@@ -9,6 +9,7 @@
 *.swo
 
 # Python
+.venv/
 __pycache__
 *.pyc
 *.pyo
@@ -32,6 +33,15 @@ tests/
 
 # Temporary files
 /tmp
+/data/
+/data2/
+/dumps/
+/server-logs/
+*.pid
+/.cloakbrowser/
+/waa-signer/.deps/
+/waa-signer/bin/
+/web/node_modules/
 snapshot_*.log
 
 # Chrome/Chromium profiles (not needed in container)

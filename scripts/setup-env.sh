@@ -3,7 +3,7 @@
 # Detects host platform and configures project-level dependencies.
 #
 # On Termux:
-#   - Ensures essential Termux packages (uv, ca-certificates, curl, proot-distro).
+#   - Ensures essential Termux packages (uv, ca-certificates, curl).
 #   - Generates a local, gitignored ./uv.toml pointing to TUR extra-index
 #     to provide prebuilt Android wheels without compilation OOM.
 #   - Links system ruff into .venv/bin/ruff if available.
@@ -27,7 +27,7 @@ if is_termux; then
 
     # 1. Install necessary Termux host packages
     NEEDED_PKGS=()
-    for p in ca-certificates curl proot-distro uv; do
+    for p in ca-certificates curl uv; do
         if ! command -v "${p}" >/dev/null 2>&1 && ! dpkg -s "${p}" >/dev/null 2>&1; then
             NEEDED_PKGS+=("${p}")
         fi
@@ -60,4 +60,25 @@ EOF
     log "Termux environment ready. Run 'uv sync' to install dependencies."
 else
     log "Standard Linux/Desktop/Docker environment detected. No extra platform configuration needed."
+fi
+
+# WAA Signer status check and guidance
+SIGNER_BIN="${PROJECT_ROOT}/waa-signer/bin/waa-signer"
+if [ ! -f "${SIGNER_BIN}" ]; then
+    log ""
+    log "=================================================================="
+    log "默认 WARP 模式使用本地 WAA 签名服务，必须先构建 (waa-signer):"
+    log "  若需使用本地原生 SpiderMonkey 152 毫秒级签名并脱离外部依赖:"
+    log "    bash waa-signer/build.sh"
+    if is_termux; then
+        log "  (Termux 环境可通过 'pkg install -y golang zig' 一键就绪编译器)"
+    else
+        log "  (需要 Go 1.27+ 以及 zig 或 clang/gcc 编译器)"
+    fi
+    log "  可运行 bash scripts/setup-runtime.sh，或直接使用 Docker 构建。"
+    log "  默认不自动切换远程签名节点，保证签名与推理共享 WARP 出口。"
+    log "=================================================================="
+    log ""
+else
+    log "已检测到本地 WAA 签名服务产物: ${SIGNER_BIN}"
 fi

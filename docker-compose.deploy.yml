@@ -1,20 +1,22 @@
 services:
   aistudio-api:
-    image: ghcr.io/deconstructedcube/aistudio-api:latest
+    image: ${AISTUDIO_IMAGE:-ghcr.io/cetaceang/aispg:latest}
     container_name: aistudio-api
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      AISTUDIO_WARP_ENABLED: ${AISTUDIO_WARP_ENABLED:-1}
     command: ["python3", "main.py", "server"]
     ports:
       - "${AISTUDIO_BIND_ADDRESS:-127.0.0.1}:${AISTUDIO_PORT:-8080}:${AISTUDIO_PORT:-8080}"
     volumes:
       - aistudio-api-data:/app/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:$${AISTUDIO_PORT:-8080}/v1beta/models || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:$${AISTUDIO_PORT:-8080}/health || exit 1"]
       interval: 30s
       timeout: 10s
-      start_period: 10s
+      start_period: 120s
       retries: 3
 
 volumes:

@@ -47,6 +47,21 @@ class GeminiCodeExecutionResult(BaseModel):
     id: str | None = None
 
 
+class GeminiVideoMetadata(BaseModel):
+    startOffset: str | None = Field(
+        default=None, validation_alias=AliasChoices("startOffset", "start_offset")
+    )
+    endOffset: str | None = Field(
+        default=None, validation_alias=AliasChoices("endOffset", "end_offset")
+    )
+    fps: float | None = None
+
+
+class GeminiSpeechMetadata(BaseModel):
+    speaker: str | None = None
+    style: str | None = None
+
+
 class GeminiPart(BaseModel):
     text: str | None = None
     inlineData: GeminiInlineData | None = Field(
@@ -54,6 +69,12 @@ class GeminiPart(BaseModel):
     )
     fileData: GeminiFileData | None = Field(
         default=None, validation_alias=AliasChoices("fileData", "file_data")
+    )
+    videoMetadata: GeminiVideoMetadata | None = Field(
+        default=None, validation_alias=AliasChoices("videoMetadata", "video_metadata")
+    )
+    speechMetadata: GeminiSpeechMetadata | None = Field(
+        default=None, validation_alias=AliasChoices("speechMetadata", "speech_metadata")
     )
     thought: bool | None = None
     thoughtSignature: str | None = Field(
@@ -122,6 +143,58 @@ class GeminiTool(BaseModel):
         return v
 
 
+class GeminiPrebuiltVoiceConfig(BaseModel):
+    voiceName: str | None = Field(
+        default=None, validation_alias=AliasChoices("voiceName", "voice_name")
+    )
+
+
+class GeminiVoiceConfig(BaseModel):
+    prebuiltVoiceConfig: GeminiPrebuiltVoiceConfig | None = Field(
+        default=None,
+        validation_alias=AliasChoices("prebuiltVoiceConfig", "prebuilt_voice_config"),
+    )
+    voice: str | None = None
+
+
+class GeminiSpeakerVoiceConfig(BaseModel):
+    speaker: str
+    voiceConfig: GeminiVoiceConfig = Field(
+        validation_alias=AliasChoices("voiceConfig", "voice_config")
+    )
+
+
+class GeminiMultiSpeakerVoiceConfig(BaseModel):
+    speakerVoiceConfigs: list[GeminiSpeakerVoiceConfig] = Field(
+        validation_alias=AliasChoices("speakerVoiceConfigs", "speaker_voice_configs")
+    )
+    mode: str | None = None
+
+
+class GeminiSpeechConfig(BaseModel):
+    voiceConfig: GeminiVoiceConfig | None = Field(
+        default=None, validation_alias=AliasChoices("voiceConfig", "voice_config")
+    )
+    languageCode: str | None = Field(
+        default=None, validation_alias=AliasChoices("languageCode", "language_code")
+    )
+    multiSpeakerVoiceConfig: GeminiMultiSpeakerVoiceConfig | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "multiSpeakerVoiceConfig", "multi_speaker_voice_config"
+        ),
+    )
+
+
+class GeminiVideoConfig(BaseModel):
+    aspectRatio: str | None = Field(
+        default=None, validation_alias=AliasChoices("aspectRatio", "aspect_ratio")
+    )
+    duration: str | None = None
+    resolution: str | None = None
+    task: str | None = None
+
+
 class GeminiGenerationConfig(BaseModel):
     stopSequences: list[str] | None = Field(
         default=None, validation_alias=AliasChoices("stopSequences", "stop_sequences")
@@ -161,6 +234,7 @@ class GeminiGenerationConfig(BaseModel):
         validation_alias=AliasChoices("responseLogprobs", "response_logprobs"),
     )
     logprobs: int | None = None
+    seed: int | None = None
     mediaResolution: list[object] | int | str | None = Field(
         default=None,
         validation_alias=AliasChoices("mediaResolution", "media_resolution"),
@@ -168,8 +242,18 @@ class GeminiGenerationConfig(BaseModel):
     thinkingConfig: list[object] | dict[str, object] | None = Field(
         default=None, validation_alias=AliasChoices("thinkingConfig", "thinking_config")
     )
+    reasoningEffort: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoningEffort", "reasoning_effort"),
+    )
     imageConfig: dict[str, object] | None = Field(
         default=None, validation_alias=AliasChoices("imageConfig", "image_config")
+    )
+    speechConfig: GeminiSpeechConfig | dict[str, object] | None = Field(
+        default=None, validation_alias=AliasChoices("speechConfig", "speech_config")
+    )
+    videoConfig: GeminiVideoConfig | dict[str, object] | None = Field(
+        default=None, validation_alias=AliasChoices("videoConfig", "video_config")
     )
 
 
@@ -195,3 +279,39 @@ class GeminiGenerateContentRequest(BaseModel):
     toolConfig: dict[str, object] | None = Field(
         default=None, validation_alias=AliasChoices("toolConfig", "tool_config")
     )
+    reasoningEffort: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoningEffort", "reasoning_effort"),
+    )
+
+
+class GeminiCountTokensRequest(BaseModel):
+    contents: list[GeminiContent] | None = None
+    generateContentRequest: GeminiGenerateContentRequest | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "generateContentRequest", "generate_content_request"
+        ),
+    )
+    systemInstruction: GeminiContent | None = Field(
+        default=None,
+        validation_alias=AliasChoices("systemInstruction", "system_instruction"),
+    )
+    tools: list[GeminiTool] | None = None
+
+
+class GeminiDecisionQuestion(BaseModel):
+    type: str
+    instructions: str | dict[str, object] | list[dict[str, object]]
+    criteria: dict[str, object] | list[str] | None = None
+    includeNoneOfAbove: bool | None = Field(
+        default=None,
+        validation_alias=AliasChoices("includeNoneOfAbove", "include_none_of_above"),
+    )
+
+
+class GeminiCreateDecisionRequest(BaseModel):
+    model: str = "gemini-decision-1"
+    input: str | dict[str, object] | list[dict[str, object]]
+    questions: dict[str, GeminiDecisionQuestion]
+    temperature: float | None = None

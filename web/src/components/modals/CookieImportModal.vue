@@ -44,8 +44,14 @@ function onFileChange(event: Event) {
     selectedFileContent.value = text
     try {
       const parsed = JSON.parse(text)
-      const list = Array.isArray(parsed) ? parsed : (parsed.accounts || parsed.profiles || [])
-      detectedCount.value = Array.isArray(list) ? list.length : 0
+      if (Array.isArray(parsed)) {
+        detectedCount.value = parsed.length
+      } else if (Array.isArray(parsed.cookies)) {
+        detectedCount.value = 1
+      } else {
+        const list = parsed.accounts || parsed.profiles || []
+        detectedCount.value = Array.isArray(list) ? list.length : 1
+      }
     } catch {
       detectedCount.value = null
     }
@@ -83,6 +89,16 @@ async function handleSubmit() {
   const raw = cookieInput.value.trim()
   if (!raw) return
 
+  if (raw.startsWith('{') && (raw.includes('"accounts"') || raw.includes('"bundle"'))) {
+    const ok = await accountsStore.importBundle({ content: raw })
+    if (ok) {
+      cookieInput.value = ''
+      namePrefix.value = ''
+      singleEmail.value = ''
+      emit('update:modelValue', false)
+    }
+    return
+  }
   const ok = autoProbe.value
     ? await accountsStore.probeAndImport({
         cookies: raw,
@@ -162,7 +178,7 @@ async function handleSubmit() {
                 点击选择凭据包文件 (.json)
               </p>
               <p class="text-[11px] text-gray-400 mt-0.5">
-                支持 AIStudio 提取器导出的 aistudio_accounts.json
+                支持批量账号凭据包 (.json) 或 Cookie JSON 数组文件
               </p>
             </div>
           </div>

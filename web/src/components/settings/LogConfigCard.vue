@@ -66,6 +66,7 @@ async function handleSave() {
     dumpToFile.value = res.dump_to_file
     dumpDir.value = res.dump_dir
     debugEnvActive.value = res.debug_env_active
+    toast.success('日志配置已保存并生效')
     emit('saved')
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : '保存配置失败'
@@ -111,7 +112,7 @@ async function handleSave() {
 
     <!-- Env variable hint banner if DEBUG is active -->
     <div
-      v-if="debugEnvActive"
+      v-if="debugEnvActive && dumpRequests"
       class="p-3.5 bg-blue-50/80 border border-blue-200 rounded-xl flex items-start gap-2.5 text-xs text-blue-900 leading-relaxed"
     >
       <Info class="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
@@ -146,7 +147,7 @@ async function handleSave() {
       <div class="p-4 bg-gray-50/60 border border-gray-200/70 rounded-2xl space-y-2">
         <div class="flex items-center gap-1.5 text-xs font-semibold text-gray-700">
           <HardDrive class="w-3.5 h-3.5 text-brand-600" />
-          <span>报文持久化落盘</span>
+          <span>报文持久化保存</span>
         </div>
         <ConfigSwitch
           :model-value="dumpToFile"

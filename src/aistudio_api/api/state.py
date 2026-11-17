@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from aistudio_api.config import resolve_stats_file, settings
@@ -29,14 +29,16 @@ class ModelStatsItem:
     errors: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    reasoning_tokens: int = 0
+    cached_tokens: int = 0
     total_tokens: int = 0
+    finish_reasons: dict[str, int] = field(default_factory=dict)
     last_used: str | None = None
 
 
 @dataclass
 class RuntimeState:
     client: AIStudioClient | None = None
-    browser_port: int = 9222
     account_service: AccountService | None = None
     rotator: AccountRotator | None = None
     model_stats: dict[str, ModelStatsItem] = field(
@@ -61,6 +63,12 @@ class RuntimeState:
             if isinstance(data, dict):
                 for model, item in data.items():
                     if isinstance(item, dict):
+                        raw_finish = item.get("finish_reasons")
+                        finish_reasons = (
+                            {str(k): int(str(v)) for k, v in raw_finish.items()}
+                            if isinstance(raw_finish, dict)
+                            else {}
+                        )
                         self.model_stats[model] = ModelStatsItem(
                             requests=int(item.get("requests", 0)),
                             success=int(item.get("success", 0)),
@@ -68,7 +76,10 @@ class RuntimeState:
                             errors=int(item.get("errors", 0)),
                             prompt_tokens=int(item.get("prompt_tokens", 0)),
                             completion_tokens=int(item.get("completion_tokens", 0)),
+                            reasoning_tokens=int(item.get("reasoning_tokens", 0)),
+                            cached_tokens=int(item.get("cached_tokens", 0)),
                             total_tokens=int(item.get("total_tokens", 0)),
+                            finish_reasons=finish_reasons,
                             last_used=str(item["last_used"])
                             if item.get("last_used")
                             else None,
@@ -122,11 +133,11 @@ class RuntimeState:
         model: str,
         result: str,
         usage: dict[str, object] | None = None,
+        finish_reason: str | None = None,
     ) -> None:
         stats = self.model_stats[model]
         stats.requests += 1
-        tz = timezone(timedelta(hours=8))
-        stats.last_used = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+        stats.last_used = datetime.now(UTC).isoformat()
 
         if result == "success":
             stats.success += 1
@@ -135,13 +146,26 @@ class RuntimeState:
         elif result == "errors":
             stats.errors += 1
 
+        if finish_reason:
+            clean_fr = str(finish_reason).strip().upper()
+            stats.finish_reasons[clean_fr] = stats.finish_reasons.get(clean_fr, 0) + 1
+
         if usage:
-            pt = usage.get("prompt_tokens", 0)
-            ct = usage.get("completion_tokens", 0)
-            tt = usage.get("total_tokens", 0)
-            stats.prompt_tokens += pt if isinstance(pt, int) else 0
-            stats.completion_tokens += ct if isinstance(ct, int) else 0
-            stats.total_tokens += tt if isinstance(tt, int) else 0
+            pt = int(str(usage.get("prompt_tokens") or 0))
+            ct = int(str(usage.get("completion_tokens") or 0))
+            tt = int(str(usage.get("total_tokens") or 0))
+            details = usage.get("completion_tokens_details")
+            rt = 0
+            if isinstance(details, dict):
+                rt = int(str(details.get("reasoning_tokens") or 0))
+            cached = int(str(usage.get("cached_tokens") or 0))
+
+            stats.prompt_tokens += pt
+            stats.completion_tokens += ct
+            stats.reasoning_tokens += rt
+            stats.cached_tokens += cached
+            stats.total_tokens += tt if tt else (pt + ct)
+
         if result in ("rate_limited", "errors"):
             self.save_stats()
         else:

@@ -6,6 +6,8 @@ import type { SystemConfig } from '@/types/system.ts'
 import ApiKeyManagerCard from '@/components/settings/ApiKeyManagerCard.vue'
 import LogConfigCard from '@/components/settings/LogConfigCard.vue'
 import VisualConfigEditor from '@/components/config/VisualConfigEditor.vue'
+import SignerServerCard from '@/components/settings/SignerServerCard.vue'
+import WarpEgressCard from '@/components/settings/WarpEgressCard.vue'
 import {
   Server,
   CheckCircle2,
@@ -51,26 +53,26 @@ onMounted(() => {
       <div class="bg-white border border-gray-200/80 rounded-2xl p-4 shadow-xs">
         <div class="flex items-center gap-2 text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
           <Server class="w-4 h-4 text-blue-600" />
-          <span>服务端口 / 浏览器</span>
+          <span>服务端口</span>
         </div>
         <div class="text-base font-bold text-gray-900 font-mono">
-          :{{ config?.port || 8080 }} <span class="text-xs text-gray-400 font-normal">/ CDP :{{ config?.browser_port || 9222 }}</span>
+          :{{ config?.port || 8080 }}
         </div>
         <div class="text-[11px] text-gray-400 mt-1">
-          无头模式: {{ config?.browser_headless ? '开启 (Headless)' : '禁用' }}
+          HTTP 服务监听端口
         </div>
       </div>
 
       <div class="bg-white border border-gray-200/80 rounded-2xl p-4 shadow-xs">
         <div class="flex items-center gap-2 text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
           <Cpu class="w-4 h-4 text-emerald-600" />
-          <span>流式响应超时</span>
+          <span>日志输出模式</span>
         </div>
         <div class="text-base font-bold text-gray-900 font-mono">
-          {{ config?.timeout_stream || 120 }}s
+          {{ config?.log_level || 'INFO' }}
         </div>
         <div class="text-[11px] text-gray-400 mt-1">
-          单次流式生成最大等待时间
+          报文持久化: {{ config?.dump_to_file ? '已启用' : '未启用' }}
         </div>
       </div>
 
@@ -134,11 +136,15 @@ onMounted(() => {
 
 
     <!-- Logging & Debug Config Card -->
+    <WarpEgressCard />
     <LogConfigCard
       v-if="config"
       :initial-config="config"
       @saved="loadConfig"
     />
+    <!-- WAA Signer Servers & Features Binding Card -->
+    <SignerServerCard @switched="loadConfig" />
+
     <!-- API Key Management Card -->
     <ApiKeyManagerCard />
 

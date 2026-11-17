@@ -1,16 +1,46 @@
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from aistudio_api.api.responses import (
     to_gemini_parts,
     to_gemini_usage_metadata,
 )
-from aistudio_api.application.api_service_gemini import classify_gemini_error_payload
+from aistudio_api.application.api_service_gemini import (
+    classify_gemini_error_payload,
+    to_gemini_finish_reason,
+)
 from aistudio_api.domain.errors import (
     AuthError,
     RequestError,
     SessionExpiredError,
+    TransportError,
     UsageLimitExceeded,
 )
+
+
+@pytest.fixture
+def ready_stream_client(monkeypatch) -> MagicMock:
+    from aistudio_api.application import api_service_gemini as gemini
+    from aistudio_api.infrastructure.gateway.client import (
+        AIStudioClient,
+        PreparedRequest,
+    )
+    from aistudio_api.infrastructure.gateway.session import SessionContext
+
+    # 协议测试隔离账号调度与外部签名，保留实际请求规范化及 SSE 序列化。
+    monkeypatch.setattr(gemini, "ensure_active_account", AsyncMock())
+    monkeypatch.setattr(gemini.runtime_state, "account_service", None)
+    client = MagicMock(spec=AIStudioClient)
+    client.prepare_request = AsyncMock(
+        return_value=PreparedRequest(
+            url="https://example.test/rpc",
+            headers={},
+            body="[]",
+            ctx=SessionContext(cookies={"SID": "synthetic_sid"}),
+        )
+    )
+    return client
 
 
 def test_to_gemini_usage_metadata_uses_visible_and_reasoning_tokens():
@@ -29,6 +59,21 @@ def test_to_gemini_usage_metadata_uses_visible_and_reasoning_tokens():
         "candidatesTokenCount": 316,
         "thoughtsTokenCount": 290,
         "totalTokenCount": 325,
+        "cachedContentTokenCount": None,
+    }
+    assert to_gemini_usage_metadata(
+        {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "cached_tokens": 80,
+        }
+    ).model_dump(mode="json", exclude_none=True) == {
+        "promptTokenCount": 100,
+        "candidatesTokenCount": 20,
+        "thoughtsTokenCount": 0,
+        "totalTokenCount": 120,
+        "cachedContentTokenCount": 80,
     }
 
 
@@ -108,6 +153,24 @@ def test_classify_gemini_error_payload():
         "Invalid value (), Unexpected list for single non-message field.",
         "INVALID_ARGUMENT",
     )
+    assert classify_gemini_error_payload(
+        TransportError("streaming request failed: Failed to fetch")
+    ) == (
+        502,
+        "streaming request failed: Failed to fetch",
+        "UNAVAILABLE",
+    )
+
+
+def test_to_gemini_finish_reason_mappings():
+    assert to_gemini_finish_reason(None) == "STOP"
+    assert to_gemini_finish_reason(1) == "STOP"
+    assert to_gemini_finish_reason(5) == "OTHER"
+    assert to_gemini_finish_reason(6) == "LANGUAGE"
+    assert to_gemini_finish_reason(15) == "IMAGE_OTHER"
+    assert to_gemini_finish_reason(16) == "NO_IMAGE"
+    assert to_gemini_finish_reason(17) == "IMAGE_RECITATION"
+    assert to_gemini_finish_reason(18) == "MISSING_THOUGHT_SIGNATURE"
 
 
 def test_clean_upstream_error_message():
@@ -129,15 +192,9 @@ def test_clean_upstream_error_message():
 
 @pytest.mark.asyncio
 async def test_handle_attempt_exception_retries_ambiguous_rpc_404_in_place():
-    from unittest.mock import MagicMock
-
     from fastapi import HTTPException
 
     from aistudio_api.application.api_service_gemini import handle_attempt_exception
-    from aistudio_api.infrastructure.gateway.client import AIStudioClient
-
-    mock_client = MagicMock(spec=AIStudioClient)
-    mock_client.clear_templates = MagicMock()
 
     # 1. Ambiguous RPC 404 error should be retried in-place without raising
     ambiguous_err = RequestError(
@@ -149,11 +206,9 @@ async def test_handle_attempt_exception_retries_ambiguous_rpc_404_in_place():
         attempt=0,
         model_path="gemini-3.7-flash",
         normalized_model="models/gemini-3.7-flash",
-        client=mock_client,
         has_yielded_data=False,
     )
     assert should_retry is True
-    mock_client.clear_templates.assert_called_once()
 
     # 2. Other legitimate 404 errors (e.g. model not found) MUST NOT be retried
     other_404 = RequestError(404, "Model 'models/nonexistent' not found.")
@@ -163,7 +218,6 @@ async def test_handle_attempt_exception_retries_ambiguous_rpc_404_in_place():
             attempt=0,
             model_path="nonexistent",
             normalized_model="models/nonexistent",
-            client=mock_client,
             has_yielded_data=False,
         )
     assert exc_info.value.status_code == 404
@@ -175,14 +229,14 @@ async def test_handle_attempt_exception_retries_ambiguous_rpc_404_in_place():
             attempt=0,
             model_path="gemini-3.7-flash",
             normalized_model="models/gemini-3.7-flash",
-            client=mock_client,
             has_yielded_data=True,
         )
 
-@pytest.mark.asyncio
-async def test_build_gemini_streaming_response_passes_requested_model():
-    from unittest.mock import MagicMock
 
+@pytest.mark.asyncio
+async def test_build_gemini_streaming_response_passes_requested_model(
+    ready_stream_client,
+):
     from aistudio_api.api.schemas import (
         GeminiContent,
         GeminiGenerateContentRequest,
@@ -191,7 +245,6 @@ async def test_build_gemini_streaming_response_passes_requested_model():
     from aistudio_api.application.api_service_gemini import (
         _build_gemini_streaming_response,
     )
-    from aistudio_api.infrastructure.gateway.client import AIStudioClient
 
     passed_model = None
 
@@ -201,8 +254,10 @@ async def test_build_gemini_streaming_response_passes_requested_model():
         yield ("chunk", b"data: test")
         yield ("finish_reason", "STOP")
 
-    mock_client = MagicMock(spec=AIStudioClient)
-    mock_client.stream_generate_content = MagicMock(side_effect=fake_stream_generate_content)
+    mock_client = ready_stream_client
+    mock_client.stream_generate_content = MagicMock(
+        side_effect=fake_stream_generate_content
+    )
 
     req = GeminiGenerateContentRequest(
         contents=[GeminiContent(role="user", parts=[GeminiPart(text="hello")])]
@@ -219,10 +274,8 @@ async def test_build_gemini_streaming_response_passes_requested_model():
 
 
 @pytest.mark.asyncio
-async def test_streaming_metadata_event_does_not_block_failover():
+async def test_streaming_metadata_event_does_not_block_failover(ready_stream_client):
     """验证在仅接收到 thought_signature 等内部元数据事件时发生异常，不会误判为已发送数据而阻断重试。"""
-    from unittest.mock import MagicMock
-
     from aistudio_api.api.schemas import (
         GeminiContent,
         GeminiGenerateContentRequest,
@@ -232,7 +285,6 @@ async def test_streaming_metadata_event_does_not_block_failover():
         _build_gemini_streaming_response,
     )
     from aistudio_api.domain.errors import RequestError
-    from aistudio_api.infrastructure.gateway.client import AIStudioClient
 
     attempt_count = 0
 
@@ -247,9 +299,10 @@ async def test_streaming_metadata_event_does_not_block_failover():
         yield ("body", "Hello world after retry")
         yield ("finish_reason", "STOP")
 
-    mock_client = MagicMock(spec=AIStudioClient)
-    mock_client.stream_generate_content = MagicMock(side_effect=fake_stream_generate_content)
-    mock_client.clear_templates = MagicMock()
+    mock_client = ready_stream_client
+    mock_client.stream_generate_content = MagicMock(
+        side_effect=fake_stream_generate_content
+    )
 
     req = GeminiGenerateContentRequest(
         contents=[GeminiContent(role="user", parts=[GeminiPart(text="hello")])]

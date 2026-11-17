@@ -8,7 +8,6 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -16,10 +15,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DEFAULT_TEXT_MODEL = os.getenv("AISTUDIO_DEFAULT_TEXT_MODEL", "gemini-3.7-flash")
-DEFAULT_IMAGE_MODEL = os.getenv(
-    "AISTUDIO_DEFAULT_IMAGE_MODEL", "gemini-3.1-flash-image-preview"
-)
-DEFAULT_BROWSER_PORT = 9222
 
 
 def _load_env(*names: str) -> str | None:
@@ -37,12 +32,6 @@ def _load_bool_env(*names: str, default: bool) -> bool:
     return value not in ("0", "false", "False")
 
 
-def _load_int_env(*names: str, default: int) -> int:
-    value = _load_env(*names)
-    if value is None:
-        return default
-    return int(value)
-
 def _load_web_password() -> str | None:
     return os.getenv("AISTUDIO_WEB_PASSWORD") or os.getenv("AISTUDIO_ADMIN_PASSWORD")
 
@@ -59,11 +48,12 @@ def _load_dump_requests_env() -> bool:
 
 
 def _load_dump_to_file_env() -> bool:
-    """检查 AISTUDIO_DUMP_FILE / AISTUDIO_DUMP_TO_FILE 环境变量是否启用请求转储落盘。"""
+    """检查 AISTUDIO_DUMP_FILE / AISTUDIO_DUMP_TO_FILE 环境变量是否启用将请求转储持久化保存到文件。"""
     val = _load_env("AISTUDIO_DUMP_FILE", "AISTUDIO_DUMP_TO_FILE")
     if val is None:
         return False
     return val.strip().lower() in ("1", "true", "yes", "on", "dump", "y", "t")
+
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_DATA_DIR = _PROJECT_ROOT / "data"
@@ -143,70 +133,53 @@ def discover_auth_file() -> str | None:
     if override:
         return override
 
-    for root in _AUTH_SEARCH_ROOTS:
-        if not root.is_dir():
+    accounts_override = os.getenv("AISTUDIO_ACCOUNTS_DIR")
+    data_override = os.getenv("AISTUDIO_DATA_DIR")
+    accounts_dirs = (
+        [Path(accounts_override)]
+        if accounts_override
+        else [Path(data_override) / "accounts"]
+        if data_override
+        else [root / "accounts" for root in _AUTH_SEARCH_ROOTS]
+    )
+    for accounts_dir in accounts_dirs:
+        if not accounts_dir.is_dir():
             continue
         # 优先从 registry.json 读取活跃账号
-        registry_path = root / "accounts" / "registry.json"
+        registry_path = accounts_dir / "registry.json"
         if registry_path.exists():
             try:
                 registry = json.loads(registry_path.read_text())
                 active_id = registry.get("active_account_id")
                 if active_id:
-                    auth_path = root / "accounts" / active_id / "auth.json"
+                    auth_path = accounts_dir / active_id / "auth.json"
                     if auth_path.exists():
                         return str(auth_path)
             except (json.JSONDecodeError, KeyError):
                 pass
-        # 回退：扫描 data/ 目录下的 .json 文件
-        for file in root.iterdir():
-            if file.suffix == ".json":
-                return str(file)
     return None
 
 
 def discover_proxy_url() -> str | None:
+    # Explicit application override wins. Ambient HTTP(S)_PROXY must not
+    # accidentally bypass our default WARP egress.
+    explicit = os.getenv("AISTUDIO_PROXY", "").strip()
+    if explicit:
+        return explicit
+    if _load_bool_env("AISTUDIO_WARP_ENABLED", default=True):
+        port = int(os.getenv("AISTUDIO_WARP_PORT", "1080"))
+        if not 1 <= port <= 65535:
+            raise ValueError("AISTUDIO_WARP_PORT must be between 1 and 65535")
+        return f"socks5://127.0.0.1:{port}"
     env_proxy = (
-        os.getenv("AISTUDIO_PROXY")
-        or os.getenv("HTTPS_PROXY")
+        os.getenv("HTTPS_PROXY")
         or os.getenv("https_proxy")
         or os.getenv("HTTP_PROXY")
         or os.getenv("http_proxy")
     )
     if env_proxy:
         return env_proxy
-    # 尝试自动探测本地代理（如 Termux 下的 Clash / v2ray）
-    import socket
-
-    for port in (7890, 10808):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(0.05)
-                if s.connect_ex(("127.0.0.1", port)) == 0:
-                    return f"http://127.0.0.1:{port}"
-        except Exception:
-            pass
     return None
-
-
-def build_browser_proxy(proxy_url: str | None) -> dict[str, str] | None:
-    if not proxy_url:
-        return None
-
-    parsed = urlparse(proxy_url)
-    if not parsed.scheme or not parsed.hostname:
-        return None
-
-    proxy: dict[str, str] = {
-        "server": f"{parsed.scheme}://{parsed.hostname}",
-    }
-    if parsed.port:
-        proxy["server"] += f":{parsed.port}"
-    if parsed.username:
-        proxy["username"] = parsed.username
-    if parsed.password:
-        proxy["password"] = parsed.password
-    return proxy
 
 
 def resolve_timezone() -> str:
@@ -227,39 +200,24 @@ def resolve_timezone() -> str:
     return "America/Los_Angeles"
 
 
-def resolve_locale() -> str:
-    """解析系统或配置语言环境（优先使用 AISTUDIO_LOCALE 环境变量）。"""
-    override = os.getenv("AISTUDIO_LOCALE")
-    if override and override.strip():
-        return override.strip()
-    return "en-US"
-
-
 @dataclass(slots=True)
 class Settings:
     port: int = int(os.getenv("AISTUDIO_PORT", "8080"))
-    browser_port: int = _load_int_env(
-        "AISTUDIO_BROWSER_PORT", default=DEFAULT_BROWSER_PORT
+    proof_server_url: str = os.getenv(
+        "AISTUDIO_PROOF_SERVER_URL", "https://waa.spinsnow.fun"
     )
-    browser_headless: bool = _load_bool_env("AISTUDIO_BROWSER_HEADLESS", default=True)
-    browser_executable_path: str | None = os.getenv("AISTUDIO_BROWSER_EXECUTABLE")
     auth_file: str | None = discover_auth_file()
     tmp_dir: str = os.getenv("AISTUDIO_TMP_DIR", tempfile.gettempdir())
     proxy_url: str | None = discover_proxy_url()
+    warp_enabled: bool = _load_bool_env("AISTUDIO_WARP_ENABLED", default=True)
+    warp_port: int = int(os.getenv("AISTUDIO_WARP_PORT", "1080"))
+    warp_dir: str = _load_env("AISTUDIO_WARP_DIR") or str(resolve_data_dir() / "warp")
+    warp_profile: str = os.getenv("AISTUDIO_WARP_PROFILE", "")
+    warp_endpoint: str = os.getenv("AISTUDIO_WARP_ENDPOINT", "")
+    warp_start_timeout: float = float(os.getenv("AISTUDIO_WARP_START_TIMEOUT", "60"))
     web_password: str | None = _load_web_password()
     api_keys: frozenset[str] = frozenset()
-    timeout_replay: int = int(os.getenv("AISTUDIO_TIMEOUT_REPLAY", "600"))
-    timeout_stream: int = int(os.getenv("AISTUDIO_TIMEOUT_STREAM", "600"))
     timezone: str = resolve_timezone()
-    locale: str = resolve_locale()
-    dump_raw_response: bool = os.getenv("AISTUDIO_DUMP_RAW_RESPONSE", "0") in (
-        "1",
-        "true",
-        "True",
-    )
-    dump_raw_response_dir: str = os.getenv(
-        "AISTUDIO_DUMP_RAW_RESPONSE_DIR", tempfile.gettempdir()
-    )
     data_dir: str = str(resolve_data_dir())
     accounts_dir: str = os.getenv("AISTUDIO_ACCOUNTS_DIR", "")
     stats_file: str = str(resolve_stats_file())

@@ -47,11 +47,18 @@ def to_gemini_usage_metadata(
     total_tokens = _coerce_usage_int(usage.get("total_tokens"))
     if total_tokens == 0 and (prompt_tokens or candidates_tokens):
         total_tokens = prompt_tokens + candidates_tokens
+    raw_cached = usage.get("cached_tokens")
+    cached_tokens = (
+        _coerce_usage_int(raw_cached)
+        if raw_cached is not None and not isinstance(raw_cached, bool)
+        else None
+    )
     return GeminiUsageMetadata(
         promptTokenCount=prompt_tokens,
         candidatesTokenCount=candidates_tokens,
         thoughtsTokenCount=reasoning_tokens,
         totalTokenCount=total_tokens,
+        cachedContentTokenCount=cached_tokens,
     )
 
 
@@ -62,10 +69,19 @@ def to_gemini_parts(
     thinking: str = "",
     images: list[GeneratedImage] | None = None,
     reasoning_images: list[GeneratedImage] | None = None,
+    thinking_signature: str = "",
+    text_signature: str = "",
+    standalone_signature: str = "",
 ) -> list[GeminiPartResponse]:
     parts: list[GeminiPartResponse] = []
     if thinking:
-        parts.append(GeminiPartResponse(text=thinking, thought=True))
+        parts.append(
+            GeminiPartResponse(
+                text=thinking,
+                thought=True,
+                thoughtSignature=thinking_signature or None,
+            )
+        )
     for image in reasoning_images or []:
         parts.append(
             GeminiPartResponse(
@@ -77,8 +93,16 @@ def to_gemini_parts(
                 ),
             )
         )
+    effective_text_sig = text_signature or (
+        standalone_signature if (content and not function_calls and not images) else ""
+    )
     if content:
-        parts.append(GeminiPartResponse(text=content))
+        parts.append(
+            GeminiPartResponse(
+                text=content,
+                thoughtSignature=effective_text_sig or None,
+            )
+        )
     for image in images or []:
         parts.append(
             GeminiPartResponse(
@@ -122,6 +146,8 @@ def to_gemini_parts(
         if fr_id:
             resp_payload.id = str(fr_id)
         parts.append(GeminiPartResponse(functionResponse=resp_payload))
+    if standalone_signature and standalone_signature != effective_text_sig:
+        parts.append(GeminiPartResponse(thoughtSignature=standalone_signature))
     if not parts:
         parts.append(GeminiPartResponse(text=""))
     return parts

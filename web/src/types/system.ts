@@ -1,10 +1,8 @@
 export interface SystemConfig {
   port: number
-  browser_port: number
-  browser_headless: boolean
+  proof_server_url?: string
   proxy_configured: boolean
   auth_enabled: boolean
-  timeout_stream: number
   yaml_content: string
   log_level?: string
   dump_requests?: boolean
@@ -29,7 +27,14 @@ export interface UpdateLoggingConfigResponse {
 
 export interface HealthCheckResponse {
   status: string
-  busy: boolean
+}
+
+export interface EgressResponse {
+  enabled: boolean
+  mode: 'warp' | 'external_proxy' | 'direct'
+  warp?: 'on' | 'plus'
+  ip?: string
+  loc?: string
 }
 export interface ApiKeyItem {
   name: string
@@ -44,4 +49,27 @@ export interface CreateApiKeyRequest {
 
 export interface UpdateApiKeyRequest {
   name: string
+}
+
+export interface SignerServerItem {
+  id: string
+  name: string
+  description?: string
+  url: string
+  user_agent?: string
+  headers?: Record<string, string>
+  is_active?: boolean
+}
+
+export interface SignerServersResponse {
+  active_server: string
+  servers: SignerServerItem[]
+}
+
+export interface TestSignerServerResponse {
+  ok: boolean
+  status_code?: number
+  elapsed_ms: number
+  error?: string
+  data?: Record<string, unknown>
 }

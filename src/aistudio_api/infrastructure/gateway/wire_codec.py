@@ -3,26 +3,32 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 
 from aistudio_api.config import DEFAULT_TEXT_MODEL, settings
 
 from .model_defaults import resolve_model_defaults
 from .wire_parser import (
     WIRE_PART_FILE_DATA_INDEX,
-    WIRE_PART_FUNCTION_CALL_ALT_INDEX,
-    WIRE_PART_FUNCTION_CALL_INDEX,
-    WIRE_PART_FUNCTION_RESPONSE_ALT_INDEX,
-    WIRE_PART_FUNCTION_RESPONSE_INDEX,
-    WIRE_PART_INLINE_DATA_INDEX,
-    WIRE_PART_TEXT_INDEX,
-    WIRE_PART_THOUGHT_SIGNATURE_INDEX,
+    parse_response_part,
 )
-from .wire_spec import TopLevelIndex
+from .wire_spec import (
+    INTERACTIONS_AUDIO_MIME_TYPES,
+    INTERACTIONS_IMAGE_MIME_TYPES,
+    INTERACTIONS_VIDEO_MIME_TYPES,
+    CreateDecisionIndex,
+    DecisionQuestionIndex,
+    GenerationConfigIndex,
+    InteractionsContentIndex,
+    JspbArray,
+    TopLevelIndex,
+)
 from .wire_types import (
     AistudioContent,
     AistudioGenerationConfig,
     AistudioPart,
     AistudioRequest,
+    _normalize_standard_base64,
 )
 
 TOOLS_TEMPLATES: dict[str, list[object]] = {
@@ -157,17 +163,24 @@ class AistudioWireCodec:
     TOOLS_INDEX = TopLevelIndex.TOOLS
     EVERGREEN_MODEL_URI_INDEX = TopLevelIndex.EVERGREEN_MODEL_URI
     REQUEST_FLAG_INDEX = TopLevelIndex.REQUEST_FLAG
-    CACHED_CONTENT_INDEX = TopLevelIndex.CACHED_CONTENT
-    TIMEZONE_INDEX = TopLevelIndex.LOCATION
+    SESSION_TOKEN_INDEX = TopLevelIndex.SESSION_TOKEN
+    TIMEZONE_INDEX = TopLevelIndex.REQUEST_CONTEXT
 
-    def decode(self, raw_body: str) -> AistudioRequest:
-        body = json.loads(raw_body)
+    def decode(self, raw_body: str = "[]") -> AistudioRequest:
+        parsed = json.loads(raw_body)
+        if not isinstance(parsed, list):
+            raise ValueError(
+                f"wire body must be a JSON array, got {type(parsed).__name__}"
+            )
+        body = list(parsed)
+        self._ensure_len(body, self.TIMEZONE_INDEX + 1)
+        raw_gc = body[self.GENERATION_CONFIG_INDEX]
         return AistudioRequest(
-            model=body[self.MODEL_INDEX],
+            model=str(body[self.MODEL_INDEX] or DEFAULT_TEXT_MODEL),
             contents=self._decode_contents(body[self.CONTENTS_INDEX]),
             safety_settings=body[self.SAFETY_INDEX],
             generation_config=AistudioGenerationConfig(
-                list(body[self.GENERATION_CONFIG_INDEX])
+                list(raw_gc) if isinstance(raw_gc, list) else []
             ),
             snapshot=body[self.SNAPSHOT_INDEX]
             if len(body) > self.SNAPSHOT_INDEX
@@ -185,8 +198,8 @@ class AistudioWireCodec:
             request_flag=body[self.REQUEST_FLAG_INDEX]
             if len(body) > self.REQUEST_FLAG_INDEX
             else None,
-            cached_content=body[self.CACHED_CONTENT_INDEX]
-            if len(body) > self.CACHED_CONTENT_INDEX
+            session_token=body[self.SESSION_TOKEN_INDEX]
+            if len(body) > self.SESSION_TOKEN_INDEX
             else None,
             location=body[self.TIMEZONE_INDEX]
             if len(body) > self.TIMEZONE_INDEX
@@ -196,7 +209,7 @@ class AistudioWireCodec:
 
     def encode(self, request: AistudioRequest) -> str:
         body = list(request.raw_body)
-        self._ensure_len(body, self.TIMEZONE_INDEX + 1)
+        self._ensure_len(body, self.SNAPSHOT_INDEX + 1)
 
         model = request.model
         if not model.startswith("models/"):
@@ -205,29 +218,39 @@ class AistudioWireCodec:
         body[self.CONTENTS_INDEX] = [content.to_wire() for content in request.contents]
         body[self.SAFETY_INDEX] = request.safety_settings
         body[self.GENERATION_CONFIG_INDEX] = request.generation_config.values
+        if "argon" not in model.lower() and isinstance(
+            body[self.GENERATION_CONFIG_INDEX], list
+        ):
+            gc_vals = body[self.GENERATION_CONFIG_INDEX]
+            idx_45 = GenerationConfigIndex.ARGON_CAPABILITY_FLAG
+            if len(gc_vals) > idx_45 and gc_vals[idx_45] is not None:
+                gc_vals = list(gc_vals)
+                gc_vals[idx_45] = None
+                while gc_vals and gc_vals[-1] is None:
+                    gc_vals.pop()
+                body[self.GENERATION_CONFIG_INDEX] = gc_vals
         body[self.SNAPSHOT_INDEX] = request.snapshot
-        body[self.SYSTEM_INSTRUCTION_INDEX] = (
-            request.system_instruction.to_wire() if request.system_instruction else None
-        )
-        body[self.TOOLS_INDEX] = request.tools
-        body[self.EVERGREEN_MODEL_URI_INDEX] = request.evergreen_model_uri
-        body[self.REQUEST_FLAG_INDEX] = (
-            request.request_flag if request.request_flag is not None else 1
-        )
-        body[self.CACHED_CONTENT_INDEX] = request.cached_content
-        body[self.TIMEZONE_INDEX] = request.location
+
+        if request.system_instruction:
+            self._ensure_len(body, self.SYSTEM_INSTRUCTION_INDEX + 1)
+            body[self.SYSTEM_INSTRUCTION_INDEX] = request.system_instruction.to_wire()
+        if request.tools:
+            self._ensure_len(body, self.TOOLS_INDEX + 1)
+            body[self.TOOLS_INDEX] = request.tools
+        if request.evergreen_model_uri:
+            self._ensure_len(body, self.EVERGREEN_MODEL_URI_INDEX + 1)
+            body[self.EVERGREEN_MODEL_URI_INDEX] = request.evergreen_model_uri
+        if request.request_flag is not None:
+            self._ensure_len(body, self.REQUEST_FLAG_INDEX + 1)
+            body[self.REQUEST_FLAG_INDEX] = request.request_flag
+        if request.session_token is not None:
+            self._ensure_len(body, self.SESSION_TOKEN_INDEX + 1)
+            body[self.SESSION_TOKEN_INDEX] = request.session_token
 
         model_defaults = resolve_model_defaults(request.model)
-        if model_defaults.is_image_model:
-            gc = body[self.GENERATION_CONFIG_INDEX]
-            if isinstance(gc, list):
-                # Different image-capable models reject some text-model carry-over slots.
-                for idx in model_defaults.clear_generation_config_indexes:
-                    if idx < len(gc):
-                        gc[idx] = None
-            if model_defaults.disable_safety_settings:
-                body[self.SAFETY_INDEX] = None
-        else:
+        if model_defaults.disable_safety_settings:
+            body[self.SAFETY_INDEX] = None
+        if not model_defaults.is_image_model:
             if request.tools or request.location is not None:
                 self._ensure_len(body, self.TIMEZONE_INDEX + 1)
                 tz_str = settings.timezone
@@ -237,13 +260,13 @@ class AistudioWireCodec:
                     1,
                 ]
             else:
-                while len(body) > self.CACHED_CONTENT_INDEX + 1 and body[-1] is None:
+                while len(body) > self.SNAPSHOT_INDEX + 1 and body[-1] is None:
                     body.pop()
         return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
-    def rewrite(
+    def build_request(
         self,
-        original_body: str,
+        *,
         model: str = DEFAULT_TEXT_MODEL,
         snapshot: str | None = None,
         prompt: str | None = None,
@@ -253,70 +276,58 @@ class AistudioWireCodec:
         tools: list[list] | None = None,
         tool_config: list[object] | None = None,
         safety_settings: list[list] | None = None,
-        images: list[str | tuple[str, str]] | None = None,
+        images: list[tuple[str, str]] | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
         max_tokens: int | None = None,
         generation_config_overrides: dict | None = None,
-        sanitize_plain_text: bool = True,
-        safety_off: bool = False,
-    ) -> str:
-        request = self.decode(original_body)
-        request.model = model
-        model_defaults = resolve_model_defaults(model)
-        if snapshot is not None:
-            request.snapshot = snapshot
-
-        if contents is not None:
-            request.contents = contents
-        elif prompt is not None:
-            request.contents = [
-                AistudioContent.from_user_prompt(prompt=prompt, images=images)
-            ]
-        if system_instruction_content is not None:
-            request.system_instruction = system_instruction_content
-        else:
-            request.system_instruction = (
+    ) -> AistudioRequest:
+        effective_contents = (
+            contents
+            if contents is not None
+            else [AistudioContent.from_user_prompt(prompt=prompt or "", images=images)]
+        )
+        effective_sys = (
+            system_instruction_content
+            if system_instruction_content is not None
+            else (
                 AistudioContent(
                     role="user", parts=[AistudioPart(text=system_instruction)]
                 )
                 if system_instruction
                 else None
             )
-
+        )
+        model_defaults = resolve_model_defaults(model)
+        gc = AistudioGenerationConfig()
         defaults = model_defaults.generation_config_overrides()
         for attr, value in defaults.items():
-            setattr(request.generation_config, attr, value)
-        if model_defaults.safety_settings is not None:
-            request.safety_settings = model_defaults.safety_settings_overrides()
-        if safety_settings is not None:
-            request.safety_settings = safety_settings
+            setattr(gc, attr, value)
+        for idx in model_defaults.clear_generation_config_indexes:
+            gc._set_slot(idx, None)
+
+        effective_safety = (
+            safety_settings
+            if safety_settings is not None
+            else model_defaults.safety_settings_overrides()
+        )
 
         if max_tokens is not None:
-            request.generation_config.max_tokens = max_tokens
+            gc.max_tokens = max_tokens
         if temperature is not None:
-            request.generation_config.temperature = temperature
+            gc.temperature = temperature
         if top_p is not None:
-            request.generation_config.top_p = top_p
+            gc.top_p = top_p
         if top_k is not None:
-            request.generation_config.top_k = top_k
+            gc.top_k = top_k
         for attr, value in (generation_config_overrides or {}).items():
-            if value is None or not hasattr(request.generation_config, attr):
+            if not hasattr(gc, attr):
                 continue
-            setattr(request.generation_config, attr, value)
-        request.generation_config.enable_default_thinking()
-
-        # OpenAI chat compatibility should not inherit browser-side structured output
-        # or explicit reasoning settings from a previously captured AI Studio request.
-        if sanitize_plain_text and not model_defaults.is_image_model:
-            request.generation_config.sanitize_for_plain_text()
-            request.generation_config.enable_default_thinking()
-
-        if safety_off:
-            request.safety_settings = [[None, None, cat, 5] for cat in [7, 8, 9, 10]]
-
-        request.tools = tools if tools else None
+            setattr(gc, attr, value)
+        if "argon" not in model.lower():
+            gc._set_slot(GenerationConfigIndex.ARGON_CAPABILITY_FLAG, None)
+        effective_tools: list[list] | None = tools if tools else None
         if tool_config is not None:
             is_none_mode = False
             allowed_names: list[str] | None = None
@@ -346,11 +357,11 @@ class AistudioWireCodec:
                     if isinstance(raw_allowed, list):
                         allowed_names = [str(x) for x in raw_allowed]
             if is_none_mode:
-                request.tools = None
-            elif allowed_names is not None and request.tools:
+                effective_tools = None
+            elif allowed_names is not None and effective_tools:
                 filtered_tools: list[list[object]] = []
                 allowed_set = set(allowed_names)
-                for t in request.tools:
+                for t in effective_tools:
                     if isinstance(t, list) and len(t) > 1 and isinstance(t[1], list):
                         filtered_decls = [
                             d
@@ -361,8 +372,17 @@ class AistudioWireCodec:
                             filtered_tools.append([t[0], filtered_decls])
                     else:
                         filtered_tools.append(t)
-                request.tools = filtered_tools or None
-        return self.encode(request)
+                effective_tools = filtered_tools or None
+
+        return AistudioRequest(
+            model=model,
+            contents=effective_contents,
+            safety_settings=effective_safety,
+            generation_config=gc,
+            snapshot=snapshot,
+            system_instruction=effective_sys,
+            tools=effective_tools,
+        )
 
     def _decode_contents(self, raw_contents: object) -> list[AistudioContent]:
         contents: list[AistudioContent] = []
@@ -380,87 +400,71 @@ class AistudioWireCodec:
         return contents
 
     def _decode_part(self, raw_part) -> AistudioPart:
+        parsed = parse_response_part(raw_part)
+        part = AistudioPart(
+            thought=parsed.thought,
+            thought_signature=parsed.thought_signature or None,
+        )
+        if not isinstance(raw_part, list):
+            return part
         if (
-            isinstance(raw_part, list)
-            and len(raw_part) > WIRE_PART_FILE_DATA_INDEX
+            len(raw_part) > WIRE_PART_FILE_DATA_INDEX
             and isinstance(raw_part[WIRE_PART_FILE_DATA_INDEX], list)
-            and len(raw_part[WIRE_PART_FILE_DATA_INDEX]) >= 1
+            and raw_part[WIRE_PART_FILE_DATA_INDEX]
             and isinstance(raw_part[WIRE_PART_FILE_DATA_INDEX][0], str)
         ):
-            return AistudioPart(file_id=raw_part[WIRE_PART_FILE_DATA_INDEX][0])
-        if (
-            isinstance(raw_part, list)
-            and len(raw_part) > WIRE_PART_INLINE_DATA_INDEX
-            and isinstance(raw_part[WIRE_PART_INLINE_DATA_INDEX], list)
-            and len(raw_part[WIRE_PART_INLINE_DATA_INDEX]) >= 2
+            part.file_id = raw_part[WIRE_PART_FILE_DATA_INDEX][0]
+        elif parsed.inline_data is not None:
+            part.inline_data = parsed.inline_data
+        elif parsed.function_call is not None:
+            raw = parsed.function_call.get("raw")
+            if isinstance(raw, list):
+                name = raw[0] if raw and isinstance(raw[0], str) else "unknown"
+                args = raw[1] if len(raw) > 1 else {}
+                part.function_call = (
+                    (name, args, raw[2])
+                    if len(raw) > 2 and isinstance(raw[2], str)
+                    else (name, args)
+                )
+        elif parsed.function_response is not None:
+            raw = parsed.function_response.get("raw")
+            if isinstance(raw, list):
+                name = raw[0] if raw and isinstance(raw[0], str) else "unknown"
+                response = raw[1] if len(raw) > 1 else {}
+                part.function_response = (
+                    (name, response, raw[2])
+                    if len(raw) > 2 and isinstance(raw[2], str)
+                    else (name, response)
+                )
+        elif (
+            isinstance(parsed.executable_code, list) and len(parsed.executable_code) > 1
         ):
-            return AistudioPart(
-                inline_data=(
-                    raw_part[WIRE_PART_INLINE_DATA_INDEX][0],
-                    raw_part[WIRE_PART_INLINE_DATA_INDEX][1],
-                )
+            part.executable_code = (
+                str(parsed.executable_code[0]),
+                str(parsed.executable_code[1]),
             )
-        if isinstance(raw_part, list):
-            raw_function_call = None
-            if len(raw_part) > WIRE_PART_FUNCTION_CALL_ALT_INDEX and isinstance(
-                raw_part[WIRE_PART_FUNCTION_CALL_ALT_INDEX], list
-            ):
-                raw_function_call = raw_part[WIRE_PART_FUNCTION_CALL_ALT_INDEX]
-            elif len(raw_part) > WIRE_PART_FUNCTION_CALL_INDEX and isinstance(
-                raw_part[WIRE_PART_FUNCTION_CALL_INDEX], list
-            ):
-                raw_function_call = raw_part[WIRE_PART_FUNCTION_CALL_INDEX]
-            if raw_function_call is not None:
-                name = (
-                    raw_function_call[0]
-                    if raw_function_call and isinstance(raw_function_call[0], str)
-                    else "unknown"
-                )
-                args = raw_function_call[1] if len(raw_function_call) > 1 else {}
-                call_id = (
-                    raw_function_call[2]
-                    if len(raw_function_call) > 2
-                    and isinstance(raw_function_call[2], str)
-                    else None
-                )
-                signature = (
-                    raw_part[WIRE_PART_THOUGHT_SIGNATURE_INDEX]
-                    if len(raw_part) > WIRE_PART_THOUGHT_SIGNATURE_INDEX
-                    and isinstance(raw_part[WIRE_PART_THOUGHT_SIGNATURE_INDEX], str)
-                    else None
-                )
-                function_call = (name, args, call_id) if call_id else (name, args)
-                return AistudioPart(
-                    function_call=function_call, thought_signature=signature
-                )
-        if isinstance(raw_part, list) and (
-            (
-                len(raw_part) > WIRE_PART_FUNCTION_RESPONSE_ALT_INDEX
-                and isinstance(raw_part[WIRE_PART_FUNCTION_RESPONSE_ALT_INDEX], list)
-            )
-            or (
-                len(raw_part) > WIRE_PART_FUNCTION_RESPONSE_INDEX
-                and isinstance(raw_part[WIRE_PART_FUNCTION_RESPONSE_INDEX], list)
-            )
+        elif (
+            isinstance(parsed.code_execution_result, list)
+            and len(parsed.code_execution_result) > 1
         ):
-            raw_function_response = (
-                raw_part[WIRE_PART_FUNCTION_RESPONSE_ALT_INDEX]
-                if len(raw_part) > WIRE_PART_FUNCTION_RESPONSE_ALT_INDEX
-                and isinstance(raw_part[WIRE_PART_FUNCTION_RESPONSE_ALT_INDEX], list)
-                else raw_part[WIRE_PART_FUNCTION_RESPONSE_INDEX]
+            outcomes = {
+                1: "OUTCOME_OK",
+                2: "OUTCOME_FAILED",
+                3: "OUTCOME_DEADLINE_EXCEEDED",
+            }
+            raw_outcome = parsed.code_execution_result[0]
+            outcome_str = (
+                outcomes.get(raw_outcome, str(raw_outcome))
+                if isinstance(raw_outcome, int)
+                else str(raw_outcome)
             )
-            name = (
-                raw_function_response[0]
-                if raw_function_response and isinstance(raw_function_response[0], str)
-                else "unknown"
+            part.code_execution_result = (
+                outcome_str,
+                str(parsed.code_execution_result[1]),
             )
-            response = (
-                raw_function_response[1] if len(raw_function_response) > 1 else {}
-            )
-            return AistudioPart(function_response=(name, response))
-        if isinstance(raw_part, list) and len(raw_part) > WIRE_PART_TEXT_INDEX:
-            return AistudioPart(text=raw_part[WIRE_PART_TEXT_INDEX])
-        return AistudioPart()
+        else:
+            part.text = parsed.text
+        return part
 
     def _decode_system_instruction(self, raw_instruction) -> AistudioContent | None:
         if not raw_instruction or not isinstance(raw_instruction, list):
@@ -485,8 +489,8 @@ class AistudioWireCodec:
 _codec = AistudioWireCodec()
 
 
-def modify_body(
-    original_body: str,
+def encode_request_body(
+    *,
     model: str = DEFAULT_TEXT_MODEL,
     snapshot: str | None = None,
     prompt: str | None = None,
@@ -496,17 +500,14 @@ def modify_body(
     tools: list[list] | None = None,
     tool_config: list[object] | None = None,
     safety_settings: list[list] | None = None,
-    images: list[str | tuple[str, str]] | None = None,
+    images: list[tuple[str, str]] | None = None,
     temperature: float | None = None,
     top_p: float | None = None,
     top_k: int | None = None,
     max_tokens: int | None = None,
     generation_config_overrides: dict | None = None,
-    sanitize_plain_text: bool = True,
-    safety_off: bool = False,
 ) -> str:
-    return _codec.rewrite(
-        original_body=original_body,
+    request = _codec.build_request(
         model=model,
         snapshot=snapshot,
         prompt=prompt,
@@ -522,6 +523,220 @@ def modify_body(
         top_k=top_k,
         max_tokens=max_tokens,
         generation_config_overrides=generation_config_overrides,
-        sanitize_plain_text=sanitize_plain_text,
-        safety_off=safety_off,
     )
+    return _codec.encode(request)
+
+
+def _normalize_interactions_blocks(
+    raw_input: str | dict[str, object] | Sequence[object],
+) -> list[dict[str, object]]:
+    if isinstance(raw_input, str):
+        if not raw_input:
+            raise ValueError("input must not be empty")
+        return [{"type": "text", "text": raw_input}]
+    if isinstance(raw_input, dict):
+        return [raw_input]
+    blocks = [item for item in raw_input if isinstance(item, dict)]
+    if not blocks:
+        raise ValueError("input must contain at least one content block")
+    return blocks
+
+
+def _encode_interactions_block(block: dict[str, object]) -> list[object]:
+    block_type = str(block.get("type") or "").strip().lower()
+    if not block_type and "text" in block:
+        block_type = "text"
+
+    wire = JspbArray()
+    if block_type == "text":
+        text = block.get("text")
+        if not isinstance(text, str):
+            raise ValueError("text content block requires string 'text'")
+        wire[InteractionsContentIndex.TEXT] = [text, None]
+        return wire.compact()
+
+    mime_type = (
+        str(block.get("mime_type") or block.get("mimeType") or "").strip().lower()
+    )
+    raw_data = block.get("data")
+    data = (
+        _normalize_standard_base64(raw_data)
+        if isinstance(raw_data, str) and raw_data
+        else None
+    )
+    uri = block.get("uri")
+    if not isinstance(uri, str) or not uri:
+        uri = None
+    if data is None and uri is None:
+        raise ValueError(
+            f"{block_type or 'media'} content block requires 'data' or 'uri'"
+        )
+
+    if block_type == "image":
+        mime_code = INTERACTIONS_IMAGE_MIME_TYPES.get(mime_type, 0)
+        media_wire = JspbArray([mime_code])
+        if data is not None:
+            media_wire[1] = data
+        if uri is not None:
+            media_wire[2] = uri
+        wire[InteractionsContentIndex.IMAGE] = media_wire.compact()
+        return wire.compact()
+
+    if block_type == "audio":
+        mime_code = INTERACTIONS_AUDIO_MIME_TYPES.get(mime_type, 0)
+        media_wire = JspbArray([mime_code])
+        if data is not None:
+            media_wire[1] = data
+        if uri is not None:
+            media_wire[2] = uri
+        wire[InteractionsContentIndex.AUDIO] = media_wire.compact()
+        return wire.compact()
+
+    if block_type == "document":
+        mime_code = 1 if mime_type == "application/pdf" else 0
+        media_wire = JspbArray([mime_code])
+        if data is not None:
+            media_wire[1] = data
+        if uri is not None:
+            media_wire[2] = uri
+        wire[InteractionsContentIndex.DOCUMENT] = media_wire.compact()
+        return wire.compact()
+
+    if block_type == "video":
+        mime_code = INTERACTIONS_VIDEO_MIME_TYPES.get(mime_type, 0)
+        media_wire = JspbArray([mime_code])
+        if data is not None:
+            media_wire[1] = data
+        if uri is not None:
+            media_wire[2] = uri
+        wire[InteractionsContentIndex.VIDEO] = media_wire.compact()
+        return wire.compact()
+
+    raise ValueError(f"Unsupported Decisions API input block type: {block_type!r}")
+
+
+def extract_decision_digest_contents(
+    raw_input: str | dict[str, object] | Sequence[object],
+) -> list[AistudioContent]:
+    """Extract AistudioContent parts from Decisions input for WAA SHA-256 digest."""
+    blocks = _normalize_interactions_blocks(raw_input)
+    parts: list[AistudioPart] = []
+    for block in blocks:
+        block_type = str(block.get("type") or "").strip().lower()
+        if not block_type and "text" in block:
+            block_type = "text"
+        if block_type == "text":
+            parts.append(AistudioPart(text=str(block.get("text") or "")))
+        elif isinstance(block.get("data"), str) and block["data"]:
+            mime_type = str(
+                block.get("mime_type")
+                or block.get("mimeType")
+                or "application/octet-stream"
+            )
+            parts.append(AistudioPart(inline_data=(mime_type, str(block["data"]))))
+        elif isinstance(block.get("uri"), str) and block["uri"]:
+            parts.append(AistudioPart(file_id=str(block["uri"])))
+    return [AistudioContent(role="user", parts=parts or [AistudioPart(text="")])]
+
+
+def _encode_decision_question(
+    question: dict[str, object],
+) -> list[object]:
+    q_type = str(question.get("type") or "").strip().lower()
+    raw_instr = question.get("instructions")
+    if isinstance(raw_instr, str):
+        instr_blocks: list[dict[str, object]] = [{"type": "text", "text": raw_instr}]
+    elif isinstance(raw_instr, dict):
+        instr_blocks = [raw_instr]
+    elif isinstance(raw_instr, list):
+        instr_blocks = [b for b in raw_instr if isinstance(b, dict)]
+    else:
+        raise ValueError("question.instructions is required")
+    if not instr_blocks:
+        raise ValueError("question.instructions must not be empty")
+
+    instr_wire = [_encode_interactions_block(b) for b in instr_blocks]
+    q_wire = JspbArray()
+    q_wire[DecisionQuestionIndex.INSTRUCTIONS] = instr_wire
+
+    criteria = question.get("criteria")
+    if q_type == "noul":
+        if isinstance(criteria, dict):
+            true_desc = str(
+                criteria.get("true_description")
+                or criteria.get("trueDescription")
+                or ""
+            )
+            false_desc = str(
+                criteria.get("false_description")
+                or criteria.get("falseDescription")
+                or ""
+            )
+            q_wire[DecisionQuestionIndex.NOUL] = [[true_desc, false_desc]]
+        else:
+            q_wire[DecisionQuestionIndex.NOUL] = []
+    elif q_type == "choice":
+        if not isinstance(criteria, dict) or len(criteria) < 2:
+            raise ValueError(
+                "choice question requires criteria map with at least 2 options"
+            )
+        sorted_entries = sorted(
+            ((str(k), "" if v is None else str(v)) for k, v in criteria.items()),
+            key=lambda item: item[0].encode("utf-8"),
+        )
+        choice_wire = JspbArray([[[k, v] for k, v in sorted_entries]])
+        inc_none = question.get(
+            "includeNoneOfAbove", question.get("include_none_of_above")
+        )
+        if isinstance(inc_none, bool):
+            choice_wire[1] = inc_none
+        q_wire[DecisionQuestionIndex.CHOICE] = choice_wire.compact()
+    elif q_type == "score":
+        if not isinstance(criteria, list) or len(criteria) < 2:
+            raise ValueError(
+                "score question requires criteria list with at least 2 levels"
+            )
+        levels = [str(item) for item in criteria]
+        q_wire[DecisionQuestionIndex.SCORE] = [levels]
+    else:
+        raise ValueError(f"Unsupported Decisions question type: {q_type!r}")
+
+    return q_wire.compact()
+
+
+def encode_decision_request_body(
+    *,
+    model: str = "models/gemini-decision-1",
+    raw_input: str | dict[str, object] | Sequence[object],
+    questions: dict[str, dict[str, object]],
+    temperature: float | None = None,
+    snapshot: str | None = None,
+) -> str:
+    if not questions:
+        raise ValueError("questions must not be empty")
+    norm_model = model if model.startswith("models/") else f"models/{model}"
+    blocks = _normalize_interactions_blocks(raw_input)
+    input_wire = [_encode_interactions_block(block) for block in blocks]
+    questions_wire = [
+        [str(q_key), _encode_decision_question(q_val)]
+        for q_key, q_val in questions.items()
+    ]
+    body = JspbArray()
+    body[CreateDecisionIndex.MODEL] = norm_model
+    body[CreateDecisionIndex.INPUT] = input_wire
+    body[CreateDecisionIndex.QUESTIONS] = questions_wire
+    if temperature is not None and float(temperature) > 0:
+        body[CreateDecisionIndex.TEMPERATURE] = float(temperature)
+    if snapshot:
+        body[CreateDecisionIndex.REQUEST_SNAPSHOT] = snapshot
+    return json.dumps(body.compact(), separators=(",", ":"), ensure_ascii=False)
+
+
+def encode_count_tokens_body(
+    *,
+    model: str,
+    contents: list[AistudioContent],
+) -> str:
+    norm_model = model if model.startswith("models/") else f"models/{model}"
+    payload = [norm_model, [content.to_wire() for content in contents]]
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)

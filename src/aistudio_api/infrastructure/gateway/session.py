@@ -1,549 +1,429 @@
-"""Shared browser session management for gateway operations."""
+"""Gateway session management for authentication and request signing."""
 
 from __future__ import annotations
 
 import asyncio
-import json
+import inspect
+import itertools
+import time
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager, suppress
-from hashlib import sha256
-from pathlib import Path
+from contextlib import aclosing
+from dataclasses import dataclass, field
 
 from aistudio_api.config import settings
-from aistudio_api.infrastructure.browser.browser_engine import (
-    ChromiumProcess,
-    launch_chromium_process,
-)
-from aistudio_api.infrastructure.browser.cdp_client import CDPClient, CDPPage
-from aistudio_api.infrastructure.browser.scripts import (
-    DOM_GC_CLEANUP_JS,
-    SNAPSHOT_GENERATE_JS,
-)
-from aistudio_api.infrastructure.gateway.botguard_bootstrap import (
-    BOTGUARD_BOOTSTRAP_PROMPT,
-    bootstrap_botguard_and_template,
-)
-from aistudio_api.infrastructure.gateway.session_auth import (
-    bootstrap_google_session,
-    derive_profile_dir,
-    extract_account_email,
-    extract_account_tier,
+from aistudio_api.domain.errors import StaleSessionError
+from aistudio_api.infrastructure.account.cookie_parser import (
+    ROTATING_SESSION_COOKIE_NAMES,
+    build_makersuite_headers,
     get_auth_user_from_meta,
+    get_cookie_id_from_meta,
     get_tier_from_meta,
-    is_aistudio_page_url,
-    is_login_page_url,
-    load_cookies_to_page,
-    navigate_to_aistudio,
-    save_browser_cookies,
+    load_cookies_from_auth_file,
+    parse_raw_cookies,
 )
-from aistudio_api.infrastructure.gateway.session_state import (
-    SessionContext,
-    SessionReadinessGate,
-    SessionState,
+from aistudio_api.infrastructure.gateway.headers import (
+    merge_header_case_insensitive,
 )
-from aistudio_api.infrastructure.gateway.transport import XHRStreamTransport
+from aistudio_api.infrastructure.gateway.transport import HTTPStreamTransport
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
 from aistudio_api.infrastructure.utils.logger import get_logger
+from aistudio_api.infrastructure.waa.signer import WaaSigner
 
 log = get_logger("session")
 
-_is_login_page_url = is_login_page_url
-_is_aistudio_page_url = is_aistudio_page_url
 
-DEFAULT_BOOTSTRAP_TEMPLATE: dict[str, object] = {
-    "url": "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GenerateContent",
-    "headers": {
-        "Content-Type": "application/json+protobuf",
-        "X-User-Agent": "grpc-web-javascript/0.1",
-        "X-Goog-Api-Key": "AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs",
-        "X-Goog-AuthUser": "0",
-        "Referer": "https://aistudio.google.com/",
-    },
-    "body": '["models/gemini-3.7-flash"]',
-}
+@dataclass
+class SessionContext:
+    """Encapsulates active authentication context and metadata for AI Studio gateway."""
+
+    auth_user: str = "0"
+    auth_file: str | None = None
+    tier: str = "Free"
+    cookies: dict[str, str] = field(default_factory=dict)
+    cookie_id: str = ""
+    context_id: int = field(default_factory=itertools.count(1).__next__)
+    created_at: float = field(default_factory=time.time)
+
+    def is_usable(self) -> bool:
+        return bool(self.auth_file or self.cookies)
 
 
-class BrowserSession:
-    """Coordinates browser lifecycle, readiness gate, and blue-green tab transitions."""
+GENERATE_CONTENT_URL = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GenerateContent"
+CREATE_DECISION_URL = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/CreateDecision"
+COUNT_TOKENS_URL = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/CountTokens"
 
-    def __init__(self, port: int):
-        self.port = port
+DEFAULT_UPSTREAM_HEADERS: dict[str, str] = build_makersuite_headers()
+
+
+class GatewaySession:
+    """Manages authentication state, WAA request signing, and transport routing."""
+
+    def __init__(self):
         self._auth_file: str | None = settings.auth_file or None
         self._auth_user: str | None = None
         self._tier: str | None = None
-        self._profile_dir = derive_profile_dir(self._auth_file)
-        self._proc: ChromiumProcess | None = None
-        self._cdp_client: CDPClient | None = None
+        self._active_context: SessionContext | None = None
+        self._signing_locks: dict[str, asyncio.Lock] = {}
+        self._context_signer_headers: dict[str, dict[str, str]] = {}
+        self._transport = HTTPStreamTransport(proxy_url=settings.proxy_url)
+        from aistudio_api.infrastructure.gateway.model_defaults import (
+            get_active_waa_server,
+        )
 
-        self._gate = SessionReadinessGate()
-        self._transition_lock = asyncio.Lock()
-        self._snapshot_lock = asyncio.Lock()
-        self._transport = XHRStreamTransport()
-        self._retiring_contexts: list[SessionContext] = []
-        self._background_tasks: set[asyncio.Task[object]] = set()
-        self._in_flight: int = 0
-        self._stream_cleanup_count: int = 0
-
-    @property
-    def state(self) -> SessionState:
-        return self._gate.state
+        active_waa = get_active_waa_server()
+        server_url = str(active_waa.get("url") or settings.proof_server_url)
+        self._signer = WaaSigner(
+            proof_server_url=server_url,
+            proxy_url=settings.proxy_url,
+        )
 
     @property
     def is_ready(self) -> bool:
-        return self._gate.is_ready()
+        return self._active_context is not None and self._active_context.is_usable()
 
     @property
     def active_context(self) -> SessionContext | None:
-        return self._gate.active_context
+        return self._active_context
 
-    @property
-    def page(self) -> CDPPage | None:
-        return self._gate.active_context.page if self._gate.active_context else None
-
-    @property
-    def snap_key(self) -> str | None:
-        return self._gate.active_context.snap_key if self._gate.active_context else None
-
-    @property
-    def base_template(self) -> dict[str, object] | None:
-        return (
-            self._gate.active_context.base_template
-            if self._gate.active_context
-            else None
+    def is_context_current(self, context: SessionContext) -> bool:
+        """凭据代际变化后，旧快照不得再次进入签名服务或回写。"""
+        return not context.auth_file or (
+            get_cookie_id_from_meta(context.auth_file) == context.cookie_id
         )
+
+    @staticmethod
+    def _context_header_key(ctx: SessionContext) -> str:
+        return ctx.auth_file or f"auth-user:{ctx.auth_user}"
+
+    @property
+    def last_signer_headers(self) -> dict[str, str]:
+        """Get dynamic protocol headers returned by the underlying signer."""
+        return self._signer.last_headers
+
+    def get_signer_headers(self, ctx: SessionContext | None = None) -> dict[str, str]:
+        """Get dynamic protocol headers isolated to the given account context."""
+        if ctx is not None:
+            key = self._context_header_key(ctx)
+            if key in self._context_signer_headers:
+                return dict(self._context_signer_headers[key])
+            if not self._context_signer_headers:
+                raw = getattr(self._signer, "last_headers", None)
+                return dict(raw) if isinstance(raw, dict) else {}
+            return {}
+        raw = getattr(self._signer, "last_headers", None)
+        return dict(raw) if isinstance(raw, dict) else {}
 
     def set_ready_context(self, context: SessionContext) -> None:
         """Set active ready context (used by transitions and test fixtures)."""
-        self._gate.set_ready(context)
+        self._auth_file = context.auth_file
+        self._auth_user = context.auth_user
+        self._tier = context.tier
+        self._active_context = context
 
     def get_current_auth_user(self) -> str:
-        """获取当前活跃账号的 auth_user 编号（0, 1, 2...）。"""
+        """Get auth_user index of active account."""
         if self._auth_user is not None:
             return self._auth_user
-        if self._gate.active_context is not None:
-            return self._gate.active_context.auth_user
+        if self._active_context is not None:
+            return self._active_context.auth_user
         return get_auth_user_from_meta(self._auth_file)
 
     def get_current_tier(self) -> str:
-        """获取当前活跃账号的订阅权益等级 (Free / Pro / Ultra / Plus)。"""
-        if self._gate.active_context is not None and self._gate.active_context.tier:
-            return self._gate.active_context.tier
+        """Get benefit tier of active account."""
+        if self._active_context is not None and self._active_context.tier:
+            return self._active_context.tier
         if self._tier is not None:
             return self._tier
         return get_tier_from_meta(self._auth_file)
 
-    @asynccontextmanager
-    async def request_scope(self):
-        """追踪活动请求。"""
-        self._in_flight += 1
-        ctx = self.active_context
-        if ctx is not None:
-            ctx.in_flight += 1
-        try:
-            yield ctx
-        finally:
-            self._in_flight = max(0, self._in_flight - 1)
-            if ctx is not None:
-                ctx.decr_in_flight()
-
-    async def ensure_ready(self, timeout_s: float = 60.0) -> SessionContext:
-        """Wait until session is 100% READY."""
-        if self._gate.is_ready() and self._gate.active_context is not None:
-            return self._gate.active_context
-
-        if self._gate.state == SessionState.UNINITIALIZED:
-            await self.transition_to_account(self._auth_file, force_refresh=False)
-
-        return await self._gate.wait_ready(timeout_s=timeout_s)
-
-    async def ensure_context(self) -> CDPPage:
-        """Ensure active verified CDPPage is available, auto-reconnecting if dropped."""
-        page = self.page
-        if page is not None and not page.is_closed():
-            if await page.is_alive(timeout_s=1.0):
-                return page
-            log.warning("浏览器页面无响应，重新连接...")
-        await self._close_internal()
-        res = await self._ensure_browser_cdp()
-        return res or (await self.ensure_ready()).page
-
-    async def is_alive(self, timeout_s: float = 1.5) -> bool:
-        if self._proc is not None and not self._proc.is_alive():
-            return False
-        page = self.page
-        if page is None or page.is_closed():
-            return False
-        return await page.is_alive(timeout_s=timeout_s)
+    async def ensure_ready(self) -> SessionContext:
+        """Ensure session context is initialized and ready."""
+        if self.is_ready and self._active_context is not None:
+            return self._active_context
+        return await self.transition_to_account(self._auth_file, force_refresh=False)
 
     async def switch_auth(self, auth_file: str | None) -> None:
-        """Switch auth using blue-green transition without killing in-flight streams."""
+        """Atomic account switch."""
         await self.transition_to_account(auth_file, force_refresh=True)
 
     async def transition_to_account(
         self, auth_file: str | None, force_refresh: bool = False
     ) -> SessionContext:
-        """Execute atomic session transition to target auth file."""
-        async with self._transition_lock:
-            if (
-                not force_refresh
-                and self._gate.is_ready()
-                and self._gate.active_context is not None
-                and self._gate.active_context.auth_file == auth_file
-            ):
-                return self._gate.active_context
+        """Execute instantaneous in-memory session transition."""
+        if (
+            not force_refresh
+            and self.is_ready
+            and self._active_context is not None
+            and self._active_context.auth_file == auth_file
+        ):
+            return self._active_context
 
-            self._gate.set_preparing()
-            old_context = self._gate.active_context
-            target_auth_user = get_auth_user_from_meta(auth_file)
-            target_tier = get_tier_from_meta(auth_file)
-            self._auth_file = auth_file
-            self._auth_user = target_auth_user
-            self._tier = target_tier
-            self._profile_dir = derive_profile_dir(auth_file)
-            try:
-                # Real browser mode
-                if self._proc is None or not self._proc.is_alive():
-                    await self._close_internal()
-                    await self._ensure_browser_cdp()
+        target_auth_user = get_auth_user_from_meta(auth_file)
+        target_tier = get_tier_from_meta(auth_file)
+        cookies = load_cookies_from_auth_file(auth_file)
 
-                assert self._cdp_client is not None
+        self._auth_file = auth_file
+        self._auth_user = target_auth_user
+        self._tier = target_tier
 
-                # Blue-Green: always create a dedicated new tab when transitioning from an existing account
-                if old_context is not None:
-                    new_page = await self._cdp_client.create_new_page(block_assets=True)
-                else:
-                    new_page = await self._cdp_client.connect_page(block_assets=True)
+        new_context = SessionContext(
+            auth_user=target_auth_user,
+            auth_file=auth_file,
+            tier=target_tier,
+            cookies=cookies,
+            cookie_id=get_cookie_id_from_meta(auth_file),
+        )
+        self._active_context = new_context
+        log.info(
+            "会话已切换: auth_file=%s, u/%s, tier=%s",
+            auth_file,
+            target_auth_user,
+            target_tier,
+        )
+        return new_context
 
-                await load_cookies_to_page(new_page, auth_file)
-                await navigate_to_aistudio(
-                    new_page,
-                    auth_user=target_auth_user,
-                    auth_file=auth_file,
-                )
-
-                async def _reload_cb(page: CDPPage) -> bool:
-                    return await load_cookies_to_page(page, auth_file)
-
-                snap_key, base_template = await bootstrap_botguard_and_template(
-                    new_page,
-                    reload_cookies_cb=_reload_cb,
-                    is_proc_alive_cb=lambda: (
-                        self._proc is None or self._proc.is_alive()
-                    ),
-                )
-
-                target_tier = get_tier_from_meta(auth_file)
-                self._tier = target_tier
-                new_context = SessionContext(
-                    page=new_page,
-                    snap_key=snap_key,
-                    auth_user=target_auth_user,
-                    auth_file=auth_file,
-                    base_template=base_template,
-                    tier=target_tier,
-                )
-
-                if (
-                    old_context is not None
-                    and old_context.page.target_id != new_page.target_id
-                    and not old_context.page.is_closed()
-                ):
-                    self._retiring_contexts.append(old_context)
-                    drain_task = asyncio.create_task(
-                        self._drain_retiring_context(
-                            old_context, active_target_id=new_page.target_id
-                        ),
-                        name=f"drain_{old_context.auth_user}",
-                    )
-                    self._background_tasks.add(drain_task)
-                    drain_task.add_done_callback(self._background_tasks.discard)
-                self._gate.set_ready(new_context)
-                log.info(
-                    "会话蓝绿平滑热切成功: auth_file=%s, u/%s (活跃在途=%d)",
-                    auth_file,
-                    target_auth_user,
-                    self._in_flight,
-                )
-                return new_context
-
-            except Exception as exc:
-                self._gate.set_failed(exc)
-                log.error("会话切换失败: %s", exc)
-                raise
-
-    async def _drain_retiring_context(
+    async def generate_snapshot(
         self,
-        context: SessionContext,
-        active_target_id: str | None = None,
-        max_wait_s: float = 12.0,
-    ) -> None:
-        while context.in_flight > 0:
-            with suppress(TimeoutError):
-                await asyncio.wait_for(context.drain_event.wait(), timeout=max_wait_s)
-                break
-            if context.page.is_closed():
-                break
+        contents: list[AistudioContent],
+        ctx: SessionContext | None = None,
+        model: str = "models/gemini-3.7-flash",
+        force_recreate: bool = False,
+    ) -> str:
+        """同一账号串行签名，防止迟到的旧凭据重建并回滚新 Worker。"""
+        active_ctx = ctx or await self.ensure_ready()
+        key = active_ctx.auth_file or f"auth-user:{active_ctx.auth_user}"
+        lock = self._signing_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if not self.is_context_current(active_ctx):
+                raise StaleSessionError("签名快照已被新导入凭据替换")
+            try:
+                proof = await self._generate_snapshot_current(
+                    contents, active_ctx, model, force_recreate=force_recreate
+                )
+            except Exception as exc:
+                if not self.is_context_current(active_ctx):
+                    raise StaleSessionError("旧代际签名失败，凭据已更新") from exc
+                raise
+            if not self.is_context_current(active_ctx):
+                raise StaleSessionError("签名期间凭据已更新，请重新准备请求")
+            return proof
 
-        with suppress(Exception):
-            if context in self._retiring_contexts:
-                self._retiring_contexts.remove(context)
-            if not context.page.is_closed():
-                await context.page.close()
-            if (
-                self._cdp_client
-                and context.page.target_id
-                and context.page.target_id != active_target_id
-            ):
-                await self._cdp_client.close_target(context.page.target_id)
-
-    async def ensure_botguard_service(self, force_refresh: bool = False) -> CDPPage:
-        page = self.page
-        curr_url = page.url if page else ""
-        if "available-regions" in curr_url:
-            raise RuntimeError(
-                f"Google AI Studio 地区限制: 访问被重定向至 available-regions ({curr_url})"
-            )
-        if force_refresh or not self._gate.is_ready():
-            await self.transition_to_account(
-                self._auth_file, force_refresh=force_refresh
-            )
-        return (await self.ensure_ready()).page
-
-    async def capture_template(self, model: str) -> dict[str, object]:
-        if self._proc is not None and not self._proc.is_alive():
-            raise RuntimeError("Browser process died during template capture")
-
-        ctx = self.active_context
-        base = dict(ctx.base_template if ctx else DEFAULT_BOOTSTRAP_TEMPLATE)
-        normalized_model = model if model.startswith("models/") else f"models/{model}"
-        try:
-            body_val = base.get("body")
-            if (
-                isinstance(body_val, str)
-                and body_val.startswith('["models/')
-                and "," in body_val
-            ):
-                first_comma = body_val.find(",")
-                base["body"] = f'["{normalized_model}"' + body_val[first_comma:]
-            elif isinstance(body_val, str) and body_val.startswith("["):
-                body_list = json.loads(body_val)
-                if isinstance(body_list, list) and len(body_list) > 0:
-                    body_list[0] = normalized_model
-                    base["body"] = json.dumps(body_list, separators=(",", ":"))
-        except Exception as e:
-            log.debug("Failed to adapt model into base template body: %s", e)
-        return base
-
-    async def generate_snapshot(self, contents: list[AistudioContent]) -> str:
-        ctx = await self.ensure_ready()
-        hash_parts: list[str] = []
-        for content in contents:
-            for part in content.parts:
-                if part.text is not None:
-                    hash_parts.append(str(part.text))
-                elif part.inline_data is not None:
-                    hash_parts.append(str(part.inline_data[1]))
-                elif part.file_id is not None:
-                    hash_parts.append(str(part.file_id))
-                elif part.executable_code is not None:
-                    hash_parts.append(str(part.executable_code[1]))
-                elif part.code_execution_result is not None:
-                    hash_parts.append(str(part.code_execution_result[1]))
-                else:
-                    hash_parts.append("")
-
-        content_hash = sha256(" ".join(hash_parts).encode("utf-8")).hexdigest()
-
-        async with self._snapshot_lock:
-            for attempt in range(3):
-                try:
-                    snapshot = await ctx.page.evaluate(
-                        SNAPSHOT_GENERATE_JS, args=content_hash, timeout_s=10.0
-                    )
-                    if snapshot and isinstance(snapshot, str) and len(snapshot) > 0:
-                        return snapshot
-                except Exception as e:
-                    log.debug("快照计算第 %d 次尝试失败: %s", attempt + 1, e)
-                    if attempt < 2:
-                        await ctx.page.wait_for_timeout(100)
-
-        raise RuntimeError(
-            f"Snapshot generation failed for content hash {content_hash[:8]}"
+    async def _generate_snapshot_current(
+        self,
+        contents: list[AistudioContent],
+        active_ctx: SessionContext,
+        model: str,
+        force_recreate: bool = False,
+    ) -> str:
+        """仅供已持有账号签名锁的当前代际调用。"""
+        from aistudio_api.infrastructure.gateway.model_defaults import (
+            get_active_waa_server,
         )
 
-    async def send_hooked_request(
+        active_waa = get_active_waa_server()
+        target_url = str(active_waa.get("url") or "").rstrip("/")
+        remote = getattr(self._signer, "_remote_signer", None)
+        if remote and target_url and getattr(remote, "server_url", None) != target_url:
+            close_fn = getattr(self._signer, "close", None)
+            if callable(close_fn):
+                res = close_fn()
+                if inspect.isawaitable(res):
+                    await res
+            remote.server_url = target_url
+
+        if not self.is_context_current(active_ctx):
+            raise StaleSessionError("签名前凭据代际已更新")
+        if active_ctx.auth_file:
+            disk_cookies = load_cookies_from_auth_file(active_ctx.auth_file)
+            if disk_cookies:
+                active_ctx.cookies.update(disk_cookies)
+        cookies = active_ctx.cookies
+        auth_user = active_ctx.auth_user or "0"
+        tier = active_ctx.tier or "Free"
+
+        if force_recreate:
+            proof = await self._signer.generate_snapshot(
+                contents=contents,
+                cookies=cookies,
+                auth_user=auth_user,
+                tier=tier,
+                model=model,
+                force_recreate=True,
+            )
+        else:
+            proof = await self._signer.generate_snapshot(
+                contents=contents,
+                cookies=cookies,
+                auth_user=auth_user,
+                tier=tier,
+                model=model,
+            )
+        dyn_headers = getattr(self._signer, "last_headers", None)
+        pool_state = getattr(self._signer, "last_pool_state", None)
+        if isinstance(dyn_headers, dict) and dyn_headers:
+            self._context_signer_headers[self._context_header_key(active_ctx)] = {
+                str(k): str(v) for k, v in dyn_headers.items()
+            }
+        self._sync_signer_cookies(
+            active_ctx,
+            dyn_headers=dyn_headers if isinstance(dyn_headers, dict) else None,
+            pool_state=str(pool_state) if pool_state is not None else None,
+        )
+        return proof
+
+    def _sync_signer_cookies(
+        self,
+        active_ctx: SessionContext,
+        *,
+        dyn_headers: dict[str, str] | None = None,
+        pool_state: str | None = None,
+    ) -> None:
+        """仅当 WAA 签名服务冷启动 (cold) 访问官网产生新 SIDCC 时同步回本地；严禁热复用 (hot) 用旧 PSIDTS 反向覆盖。"""
+        if not self.is_context_current(active_ctx):
+            return
+        effective_pool = (
+            pool_state
+            if pool_state is not None
+            else getattr(self._signer, "last_pool_state", None)
+        )
+        if effective_pool == "hot":
+            return
+        effective_headers = (
+            dyn_headers
+            if dyn_headers is not None
+            else getattr(self._signer, "last_headers", None)
+        )
+        if not isinstance(effective_headers, dict):
+            return
+        raw_cookie = effective_headers.get("Cookie") or effective_headers.get("cookie")
+        if not raw_cookie or not isinstance(raw_cookie, str):
+            return
+        parsed = parse_raw_cookies(raw_cookie)
+        if not parsed:
+            return
+        sync_names = (
+            ("SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC")
+            if effective_pool == "cold"
+            else ROTATING_SESSION_COOKIE_NAMES
+        )
+        changed = False
+        for k in sync_names:
+            val = parsed.get(k)
+            if val and active_ctx.cookies.get(k) != val:
+                active_ctx.cookies[k] = val
+                changed = True
+        if changed and active_ctx.auth_file:
+            try:
+                from aistudio_api.infrastructure.account.account_store import (
+                    AccountStore,
+                )
+
+                AccountStore().update_account_cookies(
+                    auth_file=active_ctx.auth_file,
+                    new_cookies=active_ctx.cookies,
+                    expected_cookie_id=active_ctx.cookie_id,
+                )
+            except Exception as e:
+                log.debug("回写签名服务 Cookie 失败: %s", e)
+
+    async def generate_snapshot_with_headers(
+        self,
+        contents: list[AistudioContent],
+        ctx: SessionContext | None = None,
+        model: str = "models/gemini-3.7-flash",
+        force_recreate: bool = False,
+    ) -> tuple[str, dict[str, str]]:
+        """Generate fresh WAA proof token and dynamic session headers."""
+        active_ctx = ctx or await self.ensure_ready()
+        proof = await self.generate_snapshot(
+            contents=contents,
+            ctx=active_ctx,
+            model=model,
+            force_recreate=force_recreate,
+        )
+        return proof, self.get_signer_headers(active_ctx)
+
+    @staticmethod
+    def build_request_headers(
+        headers: dict[str, str] | None, auth_user: str
+    ) -> dict[str, str]:
+        """合并默认上游头、鉴权用户与调用方覆盖头，全程大小写不敏感去重。"""
+        merged: dict[str, str] = {}
+        for name, value in DEFAULT_UPSTREAM_HEADERS.items():
+            merge_header_case_insensitive(merged, str(name), str(value))
+        merge_header_case_insensitive(merged, "X-Goog-AuthUser", str(auth_user or "0"))
+        for name, value in (headers or {}).items():
+            merge_header_case_insensitive(merged, str(name), str(value))
+        return merged
+
+    async def send_request(
         self,
         *,
         body: str,
-        timeout_ms: int,
         url: str | None = None,
         headers: dict[str, str] | None = None,
+        ctx: object | None = None,
     ) -> tuple[int, bytes]:
-        ctx = await self.ensure_ready()
-        captured_url = url or str(ctx.base_template.get("url") or "")
-        hdrs_val = ctx.base_template.get("headers")
-        captured_headers = headers or (
-            {str(k): str(v) for k, v in hdrs_val.items()}
-            if isinstance(hdrs_val, dict)
-            else {}
+        active_ctx = (
+            ctx if isinstance(ctx, SessionContext) else await self.ensure_ready()
         )
-        return await self._transport.send_hooked_request(
-            ctx.page,
-            url=captured_url,
-            headers=captured_headers,
+        target_url = url or GENERATE_CONTENT_URL
+        req_headers = self.build_request_headers(
+            headers, auth_user=active_ctx.auth_user
+        )
+        return await self._transport.send_request(
+            url=target_url,
+            headers=req_headers,
             body=body,
-            timeout_ms=timeout_ms,
-            auth_user=ctx.auth_user,
-            tier=ctx.tier,
+            auth_user=active_ctx.auth_user,
+            tier=active_ctx.tier,
+            auth_file=active_ctx.auth_file,
+            cookies=active_ctx.cookies,
+            expected_cookie_id=active_ctx.cookie_id,
         )
 
     async def send_streaming_request(
         self,
         *,
         body: str,
-        timeout_ms: int,
         url: str | None = None,
         headers: dict[str, str] | None = None,
+        ctx: object | None = None,
     ) -> AsyncGenerator[tuple[str, object], None]:
-        ctx = await self.ensure_ready()
-        captured_url = url or str(ctx.base_template.get("url") or "")
-        hdrs_val = ctx.base_template.get("headers")
-        captured_headers = headers or (
-            {str(k): str(v) for k, v in hdrs_val.items()}
-            if isinstance(hdrs_val, dict)
-            else {}
+        active_ctx = (
+            ctx if isinstance(ctx, SessionContext) else await self.ensure_ready()
         )
-        ctx.in_flight += 1
-        try:
-            async for event in self._transport.send_streaming_request(
-                ctx.page,
-                url=captured_url,
-                headers=captured_headers,
+        target_url = url or GENERATE_CONTENT_URL
+        req_headers = self.build_request_headers(
+            headers, auth_user=active_ctx.auth_user
+        )
+        async with aclosing(
+            self._transport.send_streaming_request(
+                url=target_url,
+                headers=req_headers,
                 body=body,
-                timeout_ms=timeout_ms,
-                auth_user=ctx.auth_user,
-                tier=ctx.tier,
-            ):
+                auth_user=active_ctx.auth_user,
+                tier=active_ctx.tier,
+                auth_file=active_ctx.auth_file,
+                cookies=active_ctx.cookies,
+                expected_cookie_id=active_ctx.cookie_id,
+            )
+        ) as events:
+            async for event in events:
                 yield event
-        finally:
-            ctx.decr_in_flight()
-            await self.cleanup_stream_page(ctx.page)
-
-    async def cleanup_stream_page(self, page: CDPPage | None = None) -> None:
-        self._stream_cleanup_count += 1
-        target_page = page or (
-            self.active_context.page if self.active_context else None
-        )
-        if (
-            target_page is not None
-            and not target_page.is_closed()
-            and (self._in_flight <= 0 or (self._stream_cleanup_count % 5 == 0))
-        ):
-            with suppress(Exception):
-                await target_page.evaluate(DOM_GC_CLEANUP_JS)
-            if self._in_flight <= 0 and (self._stream_cleanup_count % 10 == 0):
-                with suppress(Exception):
-                    await target_page.collect_garbage()
-                import gc
-
-                gc.collect()
-
-    async def import_cookies(
-        self, cookie_string: str, auth_file: str | None = None
-    ) -> int:
-        from aistudio_api.infrastructure.account.cookie_refresher import (
-            load_cookies_from_string,
-        )
-
-        pw_cookies = load_cookies_from_string(cookie_string)
-        target_auth = auth_file or self._auth_file
-        if not target_auth:
-            return len(pw_cookies)
-
-        await self._ensure_browser_cdp()
-        assert self._cdp_client is not None
-        page = await self._cdp_client.create_new_page(block_assets=False)
-        try:
-            await page.set_cookies(pw_cookies)
-            with suppress(Exception):
-                await bootstrap_google_session(page)
-            browser_cookies = await page.get_cookies()
-            final_cookies = browser_cookies or pw_cookies
-            await save_browser_cookies(
-                page, auth_file=target_auth, cookies=final_cookies
-            )
-            return len(final_cookies)
-        finally:
-            with suppress(Exception):
-                await page.close()
-                await self._cdp_client.close_target(page.target_id)
-
-    async def extract_account_email(self, page: CDPPage | None = None) -> str | None:
-        target = page or (self.active_context.page if self.active_context else None)
-        return await extract_account_email(target)
-
-    async def extract_account_tier(self, page: CDPPage | None = None) -> str | None:
-        target = page or (self.active_context.page if self.active_context else None)
-        auth_user = self.get_current_auth_user()
-        return await extract_account_tier(target, auth_user=auth_user)
-
-    async def reload_current_account_cookies(self, page: CDPPage | None = None) -> bool:
-        target = page or (self.active_context.page if self.active_context else None)
-        return bool(target and await load_cookies_to_page(target, self._auth_file))
-
-    async def _save_cookies(
-        self,
-        *,
-        auth_file: str | None = None,
-        cookies: list[dict[str, object]] | None = None,
-    ) -> None:
-        target = self.page
-        if target is not None:
-            await save_browser_cookies(
-                target, auth_file=auth_file or self._auth_file, cookies=cookies
-            )
-
-    async def _ensure_browser_cdp(self) -> CDPPage | None:
-        if self._proc is not None and self._proc.is_alive() and self._cdp_client:
-            return None
-
-        profile_dir = self._profile_dir
-        if profile_dir:
-            Path(profile_dir).mkdir(parents=True, exist_ok=True)
-
-        self._proc = launch_chromium_process(
-            port=self.port,
-            user_data_dir=profile_dir,
-            headless=settings.browser_headless,
-        )
-
-        self._cdp_client = CDPClient(port=self.port)
-        await self._cdp_client.wait_until_ready()
-        return await self._cdp_client.connect_page(block_assets=True)
 
     async def close(self) -> None:
-        async with self._transition_lock:
-            await self._close_internal()
-
-    async def _close_internal(self) -> None:
-        self._gate.reset()
-        self._retiring_contexts.clear()
-
-        if self._cdp_client is not None:
-            with suppress(Exception):
-                await self._cdp_client.close()
-            self._cdp_client = None
-
-        if self._proc is not None:
-            with suppress(Exception):
-                self._proc.terminate()
-            self._proc = None
+        """Close transport, signer, and reset active context."""
+        await self._transport.close()
+        await self._signer.close()
+        self._active_context = None
 
 
 __all__ = [
-    "BOTGUARD_BOOTSTRAP_PROMPT",
-    "DEFAULT_BOOTSTRAP_TEMPLATE",
-    "BrowserSession",
-    "_is_aistudio_page_url",
-    "_is_login_page_url",
+    "COUNT_TOKENS_URL",
+    "CREATE_DECISION_URL",
+    "DEFAULT_UPSTREAM_HEADERS",
+    "GENERATE_CONTENT_URL",
+    "GatewaySession",
+    "SessionContext",
 ]

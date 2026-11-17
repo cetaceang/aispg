@@ -12,13 +12,29 @@ from google.genai import errors, types
 
 from aistudio_api.api.app import app
 from aistudio_api.api.dependencies import get_client
+from aistudio_api.application import api_service_gemini as gemini
 from aistudio_api.domain.errors import UsageLimitExceeded
 from aistudio_api.domain.models import Candidate, ModelOutput
+from aistudio_api.infrastructure.gateway.client import PreparedRequest
+from aistudio_api.infrastructure.gateway.session import SessionContext
 
 
 @pytest.fixture
-def mock_client() -> MagicMock:
-    return MagicMock()
+def mock_client(monkeypatch) -> MagicMock:
+    # 仅替换账号和外部签名边界，官方 SDK 到 ASGI 的协议链路保持真实。
+    monkeypatch.setattr(gemini, "ensure_active_account", AsyncMock())
+    monkeypatch.setattr(gemini.runtime_state, "account_service", None)
+    monkeypatch.setattr(gemini.runtime_state, "rotator", None)
+    client = MagicMock()
+    client.prepare_request = AsyncMock(
+        return_value=PreparedRequest(
+            url="https://example.test/rpc",
+            headers={},
+            body="[]",
+            ctx=SessionContext(cookies={"SID": "synthetic_sid"}),
+        )
+    )
+    return client
 
 
 @pytest.mark.asyncio
@@ -36,6 +52,7 @@ async def test_genai_sdk_aio_non_streaming(mock_client: MagicMock) -> None:
     )
 
     app.dependency_overrides[get_client] = lambda: mock_client
+    custom_client: httpx.AsyncClient | None = None
 
     try:
         sdk_client = genai.Client(
@@ -45,11 +62,11 @@ async def test_genai_sdk_aio_non_streaming(mock_client: MagicMock) -> None:
             ),
         )
         async with sdk_client.aio as aio_client:
-            transport_obj = httpx.ASGITransport(app=app)
-            aio_client._api_client._async_httpx_client = httpx.AsyncClient(
-                transport=transport_obj,
+            custom_client = httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
                 base_url="http://testserver",
             )
+            aio_client._api_client._async_httpx_client = custom_client
 
             response = await aio_client.models.generate_content(
                 model="gemini-3.8-flash",
@@ -67,6 +84,8 @@ async def test_genai_sdk_aio_non_streaming(mock_client: MagicMock) -> None:
             assert response.usage_metadata.candidates_token_count == 20
             assert response.usage_metadata.total_token_count == 30
     finally:
+        if custom_client is not None:
+            await custom_client.aclose()
         app.dependency_overrides.clear()
 
 
@@ -91,6 +110,7 @@ async def test_genai_sdk_aio_streaming(mock_client: MagicMock) -> None:
 
     mock_client.stream_generate_content = fake_stream
     app.dependency_overrides[get_client] = lambda: mock_client
+    custom_client: httpx.AsyncClient | None = None
 
     try:
         sdk_client = genai.Client(
@@ -100,11 +120,11 @@ async def test_genai_sdk_aio_streaming(mock_client: MagicMock) -> None:
             ),
         )
         async with sdk_client.aio as aio_client:
-            transport_obj = httpx.ASGITransport(app=app)
-            aio_client._api_client._async_httpx_client = httpx.AsyncClient(
-                transport=transport_obj,
+            custom_client = httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
                 base_url="http://testserver",
             )
+            aio_client._api_client._async_httpx_client = custom_client
 
             chunks = []
             async for chunk in await aio_client.models.generate_content_stream(
@@ -140,6 +160,8 @@ async def test_genai_sdk_aio_streaming(mock_client: MagicMock) -> None:
             assert chunks[3].usage_metadata is not None
             assert chunks[3].usage_metadata.total_token_count == 20
     finally:
+        if custom_client is not None:
+            await custom_client.aclose()
         app.dependency_overrides.clear()
 
 
@@ -152,10 +174,11 @@ async def test_genai_sdk_function_calling_and_response_flow(
 
     async def fake_generate(
         model: str,
-        contents: list[object],
         **kwargs: object,
     ) -> ModelOutput:
-        captured_requests.append((model, contents))
+        captured_requests.append(
+            (model, mock_client.prepare_request.call_args.kwargs["contents"])
+        )
         if len(captured_requests) == 1:
             return ModelOutput(
                 candidates=[
@@ -182,6 +205,7 @@ async def test_genai_sdk_function_calling_and_response_flow(
 
     mock_client.generate_content = AsyncMock(side_effect=fake_generate)
     app.dependency_overrides[get_client] = lambda: mock_client
+    custom_client: httpx.AsyncClient | None = None
 
     try:
         sdk_client = genai.Client(
@@ -189,10 +213,11 @@ async def test_genai_sdk_function_calling_and_response_flow(
             http_options=types.HttpOptions(base_url="http://testserver"),
         )
         async with sdk_client.aio as aio_client:
-            aio_client._api_client._async_httpx_client = httpx.AsyncClient(
+            custom_client = httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
                 base_url="http://testserver",
             )
+            aio_client._api_client._async_httpx_client = custom_client
 
             # Turn 1: user asks question, model returns function call
             turn1_resp = await aio_client.models.generate_content(
@@ -243,6 +268,8 @@ async def test_genai_sdk_function_calling_and_response_flow(
             )
             assert len(captured_requests) == 2
     finally:
+        if custom_client is not None:
+            await custom_client.aclose()
         app.dependency_overrides.clear()
 
 
@@ -253,6 +280,7 @@ async def test_genai_sdk_standard_api_error_parsing(mock_client: MagicMock) -> N
         side_effect=UsageLimitExceeded("Daily quota exhausted for model")
     )
     app.dependency_overrides[get_client] = lambda: mock_client
+    custom_client: httpx.AsyncClient | None = None
 
     try:
         sdk_client = genai.Client(
@@ -260,10 +288,11 @@ async def test_genai_sdk_standard_api_error_parsing(mock_client: MagicMock) -> N
             http_options=types.HttpOptions(base_url="http://testserver"),
         )
         async with sdk_client.aio as aio_client:
-            aio_client._api_client._async_httpx_client = httpx.AsyncClient(
+            custom_client = httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
                 base_url="http://testserver",
             )
+            aio_client._api_client._async_httpx_client = custom_client
             with pytest.raises(errors.APIError) as exc_info:
                 await aio_client.models.generate_content(
                     model="gemini-3.8-flash",
@@ -274,6 +303,8 @@ async def test_genai_sdk_standard_api_error_parsing(mock_client: MagicMock) -> N
             assert err.status == "RESOURCE_EXHAUSTED"
             assert "daily quota" in str(err.message).lower()
     finally:
+        if custom_client is not None:
+            await custom_client.aclose()
         app.dependency_overrides.clear()
 
 
@@ -287,6 +318,7 @@ async def test_genai_sdk_tool_config_forwarding(mock_client: MagicMock) -> None:
         )
     )
     app.dependency_overrides[get_client] = lambda: mock_client
+    custom_client: httpx.AsyncClient | None = None
 
     try:
         sdk_client = genai.Client(
@@ -294,10 +326,11 @@ async def test_genai_sdk_tool_config_forwarding(mock_client: MagicMock) -> None:
             http_options=types.HttpOptions(base_url="http://testserver"),
         )
         async with sdk_client.aio as aio_client:
-            aio_client._api_client._async_httpx_client = httpx.AsyncClient(
+            custom_client = httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
                 base_url="http://testserver",
             )
+            aio_client._api_client._async_httpx_client = custom_client
             await aio_client.models.generate_content(
                 model="gemini-3.8-flash",
                 contents="What is the weather?",
@@ -326,8 +359,11 @@ async def test_genai_sdk_tool_config_forwarding(mock_client: MagicMock) -> None:
                 ),
             )
             assert mock_client.generate_content.called
-            call_kwargs = mock_client.generate_content.call_args.kwargs
+            mock_client.prepare_request.assert_awaited_once()
+            call_kwargs = mock_client.prepare_request.call_args.kwargs
             assert "tool_config" in call_kwargs
             assert call_kwargs["tool_config"] == [None, [2]]
     finally:
+        if custom_client is not None:
+            await custom_client.aclose()
         app.dependency_overrides.clear()

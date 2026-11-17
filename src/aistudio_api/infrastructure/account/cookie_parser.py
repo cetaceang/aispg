@@ -1,4 +1,4 @@
-"""解析浏览器 cookie（支持 JSON 数组、Netscape 格式与 Header KV），并提供 Google 多账号探活。"""
+"""解析 Google 账号 Cookie（支持 JSON 数组、Netscape 格式与 Header KV），并提供多账号探活。"""
 
 from __future__ import annotations
 
@@ -7,17 +7,24 @@ import json
 import re
 import time
 import uuid
-from collections.abc import Iterable
+from pathlib import Path
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    import httpx
+
+from aistudio_api.infrastructure.utils.common import mask_email
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("cookie_parser")
 
 DEFAULT_API_KEY = "AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs"
-DEFAULT_EXT_BIN = "CAESAUwwATgEQABQBGICSlBwAHgBkAEAmAEB"
+DEFAULT_EXT_BIN = "CAASAUIwATgEQABQBFgDYgJKUHAAeAGQAQCYAQE="
 DEFAULT_ORIGIN = "https://aistudio.google.com"
 DEFAULT_USER_AGENT = "grpc-web-javascript/0.1"
-
+DEFAULT_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
+)
 
 BENEFIT_TIER_TO_NAME: dict[int, str] = {
     0: "Free",
@@ -29,8 +36,24 @@ BENEFIT_TIER_TO_NAME: dict[int, str] = {
 BENEFIT_TIER_TO_HEADER: dict[str, str] = {
     "Pro": "TIER1",
     "Ultra": "TIER2",
+    "Ultra_20X": "TIER2",
     "Plus": "TIER0",
 }
+
+_CANONICAL_TIERS: dict[str, str] = {
+    "free": "Free",
+    "plus": "Plus",
+    "pro": "Pro",
+    "ultra": "Ultra",
+    "ultra_20x": "Ultra_20X",
+}
+
+
+def normalize_benefit_tier(tier: str | None) -> str:
+    """Normalize benefit tier string into canonical name (Free / Plus / Pro / Ultra / Ultra_20X)."""
+    if not tier:
+        return "Free"
+    return _CANONICAL_TIERS.get(tier.strip().lower(), "Free")
 
 
 def parse_benefit_tier_response(raw_data: object) -> str:
@@ -57,38 +80,11 @@ def get_tier_header_value(tier: str | None) -> str | None:
     """根据账号权益等级返回对应的 X-AIStudio-G1-Tier 请求头取值。"""
     if not tier:
         return None
-    clean = tier.strip().capitalize()
+    clean = normalize_benefit_tier(tier)
     return BENEFIT_TIER_TO_HEADER.get(clean)
 
 
-# Cookies that need httpOnly=False so JS can read them for SAPISIDHASH.
-_AUTH_COOKIE_NAMES = {
-    "SID",
-    "APISID",
-    "SAPISID",
-    "__Secure-1PAPISID",
-    "__Secure-3PAPISID",
-}
-
-_DOMAIN_OVERRIDES: dict[str, list[str]] = {
-    "OSID": ["aistudio.google.com"],
-    "__Secure-OSID": ["aistudio.google.com"],
-    "__Secure-BUCKET": ["aistudio.google.com"],
-    "OTZ": ["accounts.google.com"],
-    "__Host-GAPS": ["accounts.google.com"],
-    "__Host-1PLSID": ["accounts.google.com"],
-    "__Host-3PLSID": ["accounts.google.com"],
-    "LSID": ["accounts.google.com"],
-    "SMSV": ["accounts.google.com"],
-    "LSOLH": ["accounts.google.com"],
-    "ACCOUNT_CHOOSER": ["accounts.google.com"],
-    "__Secure-1PSIDTS": [".google.com", "aistudio.google.com", "accounts.google.com"],
-    "__Secure-3PSIDTS": [".google.com", "aistudio.google.com", "accounts.google.com"],
-}
-
-# 外部导入时可安全丢弃的遥测、易失效挑战及旧环境绑定的临时 Cookie。
-# 过滤这些 Cookie 既能让网页在当前 IP/环境重新自然协商下发全新凭据，
-# 又能精简内存与 Cookie 存储体积（尤其对 Android 低内存环境极为友好）：
+# 外部导入时过滤的遥测与设备绑定 Cookie。
 DISCARDABLE_IMPORT_COOKIE_NAMES: frozenset[str] = frozenset(
     {
         "_ga",
@@ -99,13 +95,119 @@ DISCARDABLE_IMPORT_COOKIE_NAMES: frozenset[str] = frozenset(
         "DV",
         "AEC",
         "NID",
-        "SIDCC",
-        "__Secure-1PSIDCC",
-        "__Secure-3PSIDCC",
         "OSID",
         "__Secure-OSID",
     }
 )
+
+ACCOUNT_HOST_ONLY_COOKIES: frozenset[str] = frozenset(
+    {
+        "LSID",
+        "__Host-1PLSID",
+        "__Host-3PLSID",
+        "__Host-GAPS",
+        "ACCOUNT_CHOOSER",
+    }
+)
+
+_ALLOWED_HOST_COOKIES: frozenset[str] = frozenset(
+    {
+        "__Host-1PLSID",
+        "__Host-3PLSID",
+    }
+)
+
+MINIMAL_COOKIE_WHITELIST: frozenset[str] = frozenset(
+    {
+        "SID",
+        "HSID",
+        "SSID",
+        "APISID",
+        "SAPISID",
+        "__Secure-1PSID",
+        "__Secure-3PSID",
+        "__Secure-1PAPISID",
+        "__Secure-3PAPISID",
+        "__Secure-1PSIDTS",
+        "__Secure-3PSIDTS",
+        "SIDCC",
+        "__Secure-1PSIDCC",
+        "__Secure-3PSIDCC",
+    }
+)
+
+ROTATE_COOKIE_WHITELIST: frozenset[str] = (
+    MINIMAL_COOKIE_WHITELIST | ACCOUNT_HOST_ONLY_COOKIES
+)
+
+ROTATING_SESSION_COOKIE_NAMES: tuple[str, ...] = (
+    "__Secure-1PSIDTS",
+    "__Secure-3PSIDTS",
+    "SIDCC",
+    "__Secure-1PSIDCC",
+    "__Secure-3PSIDCC",
+)
+
+
+def filter_minimal_cookies(
+    cookies: dict[str, str], *, include_account_host: bool = False
+) -> dict[str, str]:
+    """过滤保留核心鉴权 Cookie；默认排除 accounts.google.com 专属 Cookie。"""
+    allowed = (
+        ROTATE_COOKIE_WHITELIST if include_account_host else MINIMAL_COOKIE_WHITELIST
+    )
+    return {k: v for k, v in cookies.items() if k in allowed and v}
+
+
+def compute_session_anchor(cookies: dict[str, str]) -> str:
+    """提取浏览器会话锚点（用于识别同一窗口下的多登子账号 u/0..u/N）。"""
+    if not cookies:
+        return ""
+    return (
+        cookies.get("SAPISID")
+        or cookies.get("__Secure-3PAPISID")
+        or cookies.get("__Secure-1PAPISID")
+        or cookies.get("SID")
+        or cookies.get("__Secure-3PSID")
+        or ""
+    )
+
+
+def apply_set_cookies(
+    cookies: dict[str, str],
+    set_cookie_headers: list[str] | tuple[str, ...],
+) -> list[str]:
+    """将 HTTP 响应 Set-Cookie 头合并至 cookies 字典，返回发生变更的 Cookie 名称列表。"""
+    updated: list[str] = []
+    if not set_cookie_headers:
+        return updated
+    for raw in set_cookie_headers:
+        if not raw or not isinstance(raw, str):
+            continue
+        parts = [s.strip() for s in raw.split(";")]
+        if not parts or not parts[0]:
+            continue
+        nv, attrs = parts[0], parts[1:]
+        eq = nv.find("=")
+        if eq <= 0:
+            continue
+        name = nv[:eq].strip()
+        val = nv[eq + 1 :].strip()
+        if not name or not val or val == "deleted":
+            continue
+        if name not in ROTATE_COOKIE_WHITELIST:
+            continue
+        attr_str = "; ".join(attrs)
+        if re.search(r"domain=[^;]*gstatic\.com", attr_str, re.IGNORECASE):
+            continue
+        if re.search(r"expires=[^;]*19[789]\d", attr_str, re.IGNORECASE):
+            continue
+        if re.search(r"max-age\s*=\s*(?:0|-\d+)", attr_str, re.IGNORECASE):
+            continue
+        if cookies.get(name) != val:
+            cookies[name] = val
+            updated.append(name)
+    return updated
 
 
 def parse_raw_cookies(raw: object) -> dict[str, str]:
@@ -215,9 +317,12 @@ def calculate_sapisid_hash(
     cookies: dict[str, str], origin: str = DEFAULT_ORIGIN
 ) -> str:
     """计算 Google SAPISIDHASH 鉴权头部。"""
-    sapisid = cookies.get("SAPISID") or cookies.get("__Secure-1PAPISID") or ""
-    sapisid1p = cookies.get("__Secure-1PAPISID") or sapisid
-    sapisid3p = cookies.get("__Secure-3PAPISID") or sapisid
+    sapisid = (
+        cookies.get("SAPISID")
+        or cookies.get("__Secure-3PAPISID")
+        or cookies.get("APISID")
+        or ""
+    )
     if not sapisid:
         return ""
 
@@ -226,84 +331,124 @@ def calculate_sapisid_hash(
     def calc_hash(val: str) -> str:
         return hashlib.sha1(f"{ts} {val} {origin}".encode()).hexdigest()
 
-    h1 = f"SAPISIDHASH {ts}_{calc_hash(sapisid)}"
-    h2 = f"SAPISID1PHASH {ts}_{calc_hash(sapisid1p)}"
-    h3 = f"SAPISID3PHASH {ts}_{calc_hash(sapisid3p)}"
-    return f"{h1} {h2} {h3}"
+    parts = [f"SAPISIDHASH {ts}_{calc_hash(sapisid)}"]
+    one = cookies.get("__Secure-1PAPISID") or sapisid
+    parts.append(f"SAPISID1PHASH {ts}_{calc_hash(one)}")
+    three = cookies.get("__Secure-3PAPISID") or sapisid
+    parts.append(f"SAPISID3PHASH {ts}_{calc_hash(three)}")
+    return " ".join(parts)
 
 
-def build_google_cookie_list(
-    pairs: Iterable[tuple[str, str]] | dict[str, str],
+def build_makersuite_headers(
+    cookies: dict[str, str] | None = None,
     *,
-    allow_url_targets: bool = False,
-    discard_transient: bool = False,
-) -> list[dict[str, object]]:
-    """Build Playwright/CDP compatible cookies from name/value pairs."""
-    now = int(time.time())
-    default_expires = now + 86400 * 180  # 180 天后过期
-
-    seen: set[tuple[str, str, str]] = set()
-    cookies: list[dict[str, object]] = []
-
-    def _add_cookie(name: str, value: str, target: str) -> None:
-        is_host_target = not target.startswith(".")
-
-        if name.startswith("__Host-") and not allow_url_targets:
-            return
-
-        target_kind = "url" if allow_url_targets and is_host_target else "domain"
-        target_value = f"https://{target}/" if target_kind == "url" else target
-        key = (name, target_kind, target_value)
-        if key in seen:
-            return
-        seen.add(key)
-
-        cookie: dict[str, object] = {
-            "name": name,
-            "value": value,
-            "secure": True,
-            "httpOnly": name not in _AUTH_COOKIE_NAMES,
-            "sameSite": "None",
-            "expires": default_expires,
-        }
-        if target_kind == "url":
-            cookie["url"] = target_value
-        else:
-            cookie["domain"] = target
-            cookie["path"] = "/"
-        cookies.append(cookie)
-
-    item_list: list[tuple[str, str]] = (
-        [(str(k), str(v)) for k, v in pairs.items()]
-        if isinstance(pairs, dict)
-        else [(str(k), str(v)) for k, v in pairs]
-    )
-    for name, value in item_list:
-        if discard_transient and (
-            name in DISCARDABLE_IMPORT_COOKIE_NAMES
-            or name.startswith(("_ga_", "_gcl_"))
-        ):
-            continue
-        targets = _DOMAIN_OVERRIDES.get(name)
-        if not targets:
-            targets = [".google.com"]
-        for target in targets:
-            _add_cookie(name, value, target)
-
-    return cookies
+    auth_user: str = "0",
+    tier: str | None = None,
+    include_visit_id: bool = False,
+) -> dict[str, str]:
+    """Build standard Google AI Studio MakerSuiteService RPC headers."""
+    headers: dict[str, str] = {
+        "Content-Type": "application/json+protobuf",
+        "X-User-Agent": DEFAULT_USER_AGENT,
+        "X-Goog-Api-Key": DEFAULT_API_KEY,
+        "X-Goog-AuthUser": str(auth_user or "0"),
+        "X-Goog-Ext-519733851-bin": DEFAULT_EXT_BIN,
+        "Origin": DEFAULT_ORIGIN,
+        "Referer": f"{DEFAULT_ORIGIN}/",
+        "User-Agent": DEFAULT_BROWSER_USER_AGENT,
+    }
+    if include_visit_id:
+        headers["X-AIStudio-Visit-Id"] = f"v1_{uuid.uuid4()}"
+    tier_header = get_tier_header_value(tier)
+    if tier_header:
+        headers["X-AIStudio-G1-Tier"] = tier_header
+    if cookies:
+        auth_header = calculate_sapisid_hash(cookies)
+        if auth_header:
+            headers["Authorization"] = auth_header
+        headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items() if v)
+    return headers
 
 
 def parse_cookie_string(
     raw: object, *, discard_transient: bool = True
 ) -> dict[str, object]:
-    """将任意格式 cookie 解析为 storage state dict，包含 cookies 和 origins 字段。"""
+    """将任意格式 Cookie 解析为紧凑的持久化字典结构 `{"cookies": [{"name": ..., "value": ...}]}`。"""
     cookie_dict = parse_raw_cookies(raw)
-    return {
-        "cookies": build_google_cookie_list(
-            cookie_dict, allow_url_targets=False, discard_transient=discard_transient
-        ),
-        "origins": [],
-    }
+    cookies: list[dict[str, str]] = []
+    for name, value in cookie_dict.items():
+        if name.startswith("__Host-") and name not in _ALLOWED_HOST_COOKIES:
+            continue
+        if discard_transient and (
+            name in DISCARDABLE_IMPORT_COOKIE_NAMES
+            or name.startswith(("_ga_", "_gcl_"))
+        ):
+            continue
+        cookies.append({"name": name, "value": value})
+    return {"cookies": cookies}
+
+
+def get_auth_user_from_meta(auth_file: str | Path | None) -> str:
+    """Read auth_user index from meta.json adjacent to auth_file."""
+    if auth_file:
+        try:
+            meta_path = Path(auth_file).parent / "meta.json"
+            if meta_path.is_file():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                return str(meta.get("auth_user") or "0")
+        except Exception:
+            pass
+    return "0"
+
+
+def get_cookie_id_from_meta(auth_file: str | Path | None) -> str:
+    """读取导入代际；旧版元数据缺少 cookie_id 时使用空串。"""
+    if auth_file:
+        try:
+            meta_path = Path(auth_file).parent / "meta.json"
+            if meta_path.is_file():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                return str(meta.get("cookie_id") or "")
+        except Exception:
+            pass
+    return ""
+
+
+def get_tier_from_meta(auth_file: str | Path | None) -> str:
+    """Read benefit tier from meta.json adjacent to auth_file."""
+    if auth_file:
+        try:
+            meta_path = Path(auth_file).parent / "meta.json"
+            if meta_path.is_file():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                return normalize_benefit_tier(str(meta.get("tier") or "Free"))
+        except Exception:
+            pass
+    return "Free"
+
+
+def load_cookies_from_auth_file(auth_file: str | Path | None) -> dict[str, str]:
+    """Read cookies from auth_file into a name-value dictionary."""
+    if not auth_file:
+        return {}
+    path = Path(auth_file)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        cookies = data.get("cookies") or []
+        if isinstance(cookies, list):
+            return {
+                str(c.get("name") or ""): str(c.get("value") or "")
+                for c in cookies
+                if isinstance(c, dict) and c.get("name")
+            }
+        if isinstance(cookies, dict):
+            return {str(k): str(v) for k, v in cookies.items() if k}
+    except Exception as e:
+        logger.warning("读取 Cookie 文件失败 (%s): %s", auth_file, e)
+    return {}
+
 
 def parse_emails_from_ogs_html(
     html_text: str, default_auth_user: str = "0"
@@ -329,6 +474,8 @@ def parse_emails_from_ogs_html(
 async def probe_account_emails_map(
     raw_or_dict: object,
     auth_user: str = "0",
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> dict[str, str]:
     """通过 Google OneGoogleWidget / AI Studio 页面探测全部已登录子账号的邮箱映射。"""
     cookie_dict = (
@@ -347,53 +494,71 @@ async def probe_account_emails_map(
     u_index = str(auth_user or "0")
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        "User-Agent": DEFAULT_BROWSER_USER_AGENT,
         "Cookie": cookie_header,
     }
+
+    async def _do_fetch(http_client: httpx.AsyncClient) -> dict[str, str]:
+        resp = await http_client.get(
+            f"https://ogs.google.com/u/{u_index}/widget/account",
+            headers=headers,
+        )
+        if resp.status_code == 200:
+            emails = parse_emails_from_ogs_html(resp.text, u_index)
+            if emails:
+                return emails
+        resp_ai = await http_client.get(
+            f"https://aistudio.google.com/u/{u_index}/prompts/new_chat",
+            headers=headers,
+        )
+        if resp_ai.status_code == 200:
+            return parse_emails_from_ogs_html(resp_ai.text, u_index)
+        return {}
+
     try:
+        if client is not None:
+            return await _do_fetch(client)
         async with httpx.AsyncClient(
-            timeout=8.0, proxy=settings.proxy_url, follow_redirects=True
-        ) as client:
-            resp = await client.get(
-                f"https://ogs.google.com/u/{u_index}/widget/account",
-                headers=headers,
-            )
-            if resp.status_code == 200:
-                emails = parse_emails_from_ogs_html(resp.text, u_index)
-                if emails:
-                    return emails
-            resp_ai = await client.get(
-                f"https://aistudio.google.com/u/{u_index}/prompts/new_chat",
-                headers=headers,
-            )
-            if resp_ai.status_code == 200:
-                return parse_emails_from_ogs_html(resp_ai.text, u_index)
+            timeout=8.0,
+            proxy=settings.proxy_url,
+            follow_redirects=True,
+            trust_env=False,
+        ) as new_client:
+            return await _do_fetch(new_client)
     except Exception as e:
-        logger.debug("通过 HTTP 探测子账号 u/%s 邮箱失败: %s", u_index, e)
+        logger.debug("探测子账号 u/%s 邮箱失败: %s", u_index, e)
     return {}
 
 
 async def probe_account_email(
     raw_or_dict: object,
     auth_user: str = "0",
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> str | None:
     """探测单个指定 auth_user 的登录邮箱。"""
     u_index = str(auth_user or "0")
-    emails_map = await probe_account_emails_map(raw_or_dict, auth_user=u_index)
+    emails_map = await probe_account_emails_map(
+        raw_or_dict, auth_user=u_index, client=client
+    )
     if u_index in emails_map:
         return emails_map[u_index]
     if u_index != "0":
-        root_map = await probe_account_emails_map(raw_or_dict, auth_user="0")
+        root_map = await probe_account_emails_map(
+            raw_or_dict, auth_user="0", client=client
+        )
         if u_index in root_map:
             return root_map[u_index]
     return None
 
 
-
 async def probe_account_benefit_tier(
     raw_or_dict: object,
     auth_user: str = "0",
-) -> str:
+    *,
+    client: httpx.AsyncClient | None = None,
+    default: str | None = "Free",
+) -> str | None:
     """通过 GetAiStudioBenefitTier RPC 探测指定子账号的订阅权益等级。"""
     cookie_dict = (
         raw_or_dict
@@ -402,38 +567,189 @@ async def probe_account_benefit_tier(
         else parse_raw_cookies(raw_or_dict)
     )
     if not cookie_dict:
-        return "Free"
+        return default
 
     import httpx
 
     from aistudio_api.config import settings
 
     u_index = str(auth_user or "0")
-    auth_header = calculate_sapisid_hash(cookie_dict)
-    cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
-    headers = {
-        "Content-Type": "application/json+protobuf",
-        "X-User-Agent": DEFAULT_USER_AGENT,
-        "X-Goog-Api-Key": DEFAULT_API_KEY,
-        "X-Goog-AuthUser": u_index,
-        "X-Goog-Ext-519733851-bin": DEFAULT_EXT_BIN,
-        "X-AIStudio-Visit-Id": f"v1_{uuid.uuid4()}",
-        "Origin": DEFAULT_ORIGIN,
-        "Referer": f"{DEFAULT_ORIGIN}/",
-        "Cookie": cookie_header,
-    }
-    if auth_header:
-        headers["Authorization"] = auth_header
-
+    headers = build_makersuite_headers(
+        filter_minimal_cookies(cookie_dict),
+        auth_user=u_index,
+        include_visit_id=True,
+    )
     tier_url = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GetAiStudioBenefitTier"
     try:
-        async with httpx.AsyncClient(timeout=8.0, proxy=settings.proxy_url) as client:
+        if client is not None:
             resp = await client.post(tier_url, headers=headers, content="[]")
             if resp.status_code == 200:
                 return parse_benefit_tier_response(resp.text)
+            logger.debug(
+                "探测子账号 u/%s 权益等级返回 HTTP %d", u_index, resp.status_code
+            )
+            return default
+        async with httpx.AsyncClient(
+            timeout=8.0, proxy=settings.proxy_url, trust_env=False
+        ) as new_cli:
+            resp = await new_cli.post(tier_url, headers=headers, content="[]")
+            if resp.status_code == 200:
+                return parse_benefit_tier_response(resp.text)
+            logger.debug(
+                "探测子账号 u/%s 权益等级返回 HTTP %d", u_index, resp.status_code
+            )
     except Exception as e:
         logger.debug("探测子账号 u/%s 权益等级失败: %s", u_index, e)
-    return "Free"
+    return default
+
+
+async def probe_aistudio_session(
+    raw_or_dict: object,
+    *,
+    client: httpx.AsyncClient | None = None,
+    user_agent: str | None = None,
+) -> tuple[bool, str]:
+    """探测 AI Studio 登录会话是否仍然存活。
+
+    访问 https://aistudio.google.com/（不跟随重定向）：
+    - 200 OK：会话存活 -> (True, "ok")
+    - 302 跳转至 /welcome 或 ServiceLogin：会话已登出/失效 -> (False, "signed_out")
+    - 其他状态或网络抖动：默认视为存活，避免误杀有效凭据。
+    """
+    cookie_dict = (
+        raw_or_dict
+        if isinstance(raw_or_dict, dict)
+        and all(isinstance(v, str) for v in raw_or_dict.values())
+        else parse_raw_cookies(raw_or_dict)
+    )
+    min_cookies = filter_minimal_cookies(cookie_dict)
+    if not min_cookies:
+        return False, "no_cookies"
+
+    import httpx
+
+    from aistudio_api.config import settings
+
+    cookie_header = "; ".join(f"{k}={v}" for k, v in min_cookies.items())
+    headers = {
+        "Cookie": cookie_header,
+        "User-Agent": user_agent or DEFAULT_BROWSER_USER_AGENT,
+    }
+
+    async def _do_probe(http_client: httpx.AsyncClient) -> tuple[bool, str]:
+        resp = await http_client.get(
+            "https://aistudio.google.com/",
+            headers=headers,
+            follow_redirects=False,
+        )
+        if 300 <= resp.status_code < 400:
+            loc = resp.headers.get("location") or ""
+            if re.search(
+                r"/welcome\b|ServiceLogin|accounts\.google\.com", loc, re.IGNORECASE
+            ):
+                return False, "signed_out"
+            return True, "redirect"
+        if resp.status_code == 200:
+            return True, "ok"
+        return True, f"http_{resp.status_code}"
+
+    try:
+        if client is not None:
+            return await _do_probe(client)
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            proxy=settings.proxy_url,
+            follow_redirects=False,
+            trust_env=False,
+        ) as new_client:
+            return await _do_probe(new_client)
+    except Exception as e:
+        return True, f"probe_error:{e}"
+
+
+async def rotate_google_cookies(
+    cookies: dict[str, str],
+    *,
+    client: httpx.AsyncClient | None = None,
+    user_agent: str | None = None,
+    timeout: float = 15.0,
+) -> dict[str, object]:
+    """调用 accounts.google.com/RotateCookies 刷新短效滚动凭据 (__Secure-1PSIDTS / SIDCC)。
+
+    若调用成功，原地更新传入的 cookies 字典并返回 {"ok": True, "status": 200, "updated": [...]}。
+    """
+    if not cookies:
+        return {"ok": False, "status": 0, "updated": []}
+
+    has_rotation_seed = any(
+        cookies.get(k)
+        for k in (
+            "LSID",
+            "__Host-1PLSID",
+            "__Host-3PLSID",
+            "__Secure-1PSIDTS",
+            "__Secure-3PSIDTS",
+        )
+    )
+    if not has_rotation_seed:
+        return {"ok": False, "status": 0, "updated": [], "skipped": "missing_seed"}
+
+    import httpx
+
+    from aistudio_api.config import settings
+
+    rotate_cookies_map = filter_minimal_cookies(cookies, include_account_host=True)
+    cookie_header = "; ".join(f"{k}={v}" for k, v in rotate_cookies_map.items())
+    if not cookie_header:
+        return {"ok": False, "status": 0, "updated": []}
+
+    effective_ua = user_agent
+    if not effective_ua:
+        try:
+            from aistudio_api.infrastructure.gateway.model_defaults import (
+                get_active_waa_server,
+            )
+
+            active_waa = get_active_waa_server()
+            effective_ua = str(
+                active_waa.get("user_agent") or DEFAULT_BROWSER_USER_AGENT
+            )
+        except Exception:
+            effective_ua = DEFAULT_BROWSER_USER_AGENT
+
+    headers = {
+        "Cookie": cookie_header,
+        "User-Agent": effective_ua,
+        "Content-Type": "application/json",
+        "Origin": "https://accounts.google.com",
+        "Referer": "https://accounts.google.com/RotateCookiesPage",
+    }
+    body = '[null,"-1234567890",0]'
+
+    async def _do_rotate(http_client: httpx.AsyncClient) -> dict[str, object]:
+        resp = await http_client.post(
+            "https://accounts.google.com/RotateCookies",
+            headers=headers,
+            content=body,
+        )
+        set_cookies = resp.headers.get_list("set-cookie")
+        updated = apply_set_cookies(cookies, set_cookies)
+        return {
+            "ok": resp.status_code == 200,
+            "status": resp.status_code,
+            "updated": updated,
+        }
+
+    try:
+        if client is not None:
+            return await _do_rotate(client)
+        async with httpx.AsyncClient(
+            timeout=timeout, proxy=settings.proxy_url, trust_env=False
+        ) as new_client:
+            return await _do_rotate(new_client)
+    except Exception as e:
+        logger.debug("请求 RotateCookies 失败: %s", e)
+        return {"ok": False, "status": 0, "updated": [], "error": str(e)}
 
 
 async def probe_google_accounts_infinite(
@@ -454,30 +770,23 @@ async def probe_google_accounts_infinite(
 
     from aistudio_api.config import settings
 
-    cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
     valid_accounts: list[dict[str, object]] = []
 
     auth_user_idx = 0
     consecutive_failures = 0
-    emails_map = await probe_account_emails_map(cookie_dict, auth_user="0")
-    async with httpx.AsyncClient(timeout=10.0, proxy=settings.proxy_url) as client:
+    async with httpx.AsyncClient(
+        timeout=10.0, proxy=settings.proxy_url, trust_env=False
+    ) as client:
+        emails_map = await probe_account_emails_map(
+            cookie_dict, auth_user="0", client=client
+        )
         while True:
             u_index = str(auth_user_idx)
-            auth_header = calculate_sapisid_hash(cookie_dict)
-            headers = {
-                "Content-Type": "application/json+protobuf",
-                "X-User-Agent": DEFAULT_USER_AGENT,
-                "X-Goog-Api-Key": DEFAULT_API_KEY,
-                "X-Goog-AuthUser": u_index,
-                "X-Goog-Ext-519733851-bin": DEFAULT_EXT_BIN,
-                "X-AIStudio-Visit-Id": f"v1_{uuid.uuid4()}",
-                "Origin": DEFAULT_ORIGIN,
-                "Referer": f"{DEFAULT_ORIGIN}/",
-                "Cookie": cookie_header,
-            }
-            if auth_header:
-                headers["Authorization"] = auth_header
-
+            headers = build_makersuite_headers(
+                cookie_dict,
+                auth_user=u_index,
+                include_visit_id=True,
+            )
             url = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ListModels"
             try:
                 resp = await client.post(url, headers=headers, content="[]")
@@ -499,7 +808,7 @@ async def probe_google_accounts_infinite(
                     if not detected_email:
                         try:
                             extra_map = await probe_account_emails_map(
-                                cookie_dict, auth_user=u_index
+                                cookie_dict, auth_user=u_index, client=client
                             )
                             emails_map.update(extra_map)
                             detected_email = emails_map.get(u_index)
@@ -515,15 +824,15 @@ async def probe_google_accounts_infinite(
                         }
                     )
                     logger.info(
-                        "子账号 u/%s 探活成功 (HTTP %d, email=%s, tier=%s)",
+                        "探活子账号 u/%s 成功: 状态码=%d, 邮箱=%s, 等级=%s",
                         u_index,
                         resp.status_code,
-                        detected_email or "unknown",
+                        mask_email(detected_email) if detected_email else "无",
                         detected_tier,
                     )
                 elif resp.status_code == 401:
                     consecutive_failures += 1
-                    logger.debug("子账号 u/%s 探活返回 401 (未授权)", u_index)
+                    logger.debug("子账号 u/%s 未授权 (HTTP 401)", u_index)
                 else:
                     consecutive_failures += 1
                     logger.debug(
@@ -531,7 +840,7 @@ async def probe_google_accounts_infinite(
                     )
             except Exception as e:
                 consecutive_failures += 1
-                logger.debug("子账号 u/%s 探活异常: %s", u_index, e)
+                logger.debug("子账号 u/%s 探活请求异常: %s", u_index, e)
 
             if consecutive_failures >= max_fails_in_a_row:
                 break
